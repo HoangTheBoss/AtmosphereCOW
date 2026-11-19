@@ -3901,7 +3901,7 @@ FRESULT f_read (
 #if FF_USE_FASTSEEK
 FRESULT f_read_fast (
 	FIL* fp,			/* Pointer to the file object */
-	const void* buff,	/* Pointer to the data to be written */
+	const void* buff,	/* Pointer to the data to be read */
 	UINT btr			/* Number of bytes to read */
 )
 {
@@ -3909,11 +3909,11 @@ FRESULT f_read_fast (
 	FATFS *fs;
 	UINT csize_bytes;
 	DWORD clst;
-	DWORD wbytes;
+	DWORD rbytes;
 	UINT count;
 	FSIZE_t work_sector = 0;
 	FSIZE_t sector_base = 0;
-	BYTE *wbuff = (BYTE*)buff;
+	BYTE *rbuff = (BYTE*)buff;
 
 	res = validate(&fp->obj, &fs);			/* Check validity of the file object */
 	if (res != FR_OK || (res = (FRESULT)fp->err) != FR_OK) {
@@ -3924,19 +3924,16 @@ FRESULT f_read_fast (
 	if (!(fp->flag & FA_READ)) LEAVE_FF(fs, FR_DENIED); /* Check access mode */
 	FSIZE_t remain = fp->obj.objsize - fp->fptr;
 	if (btr > remain) btr = (UINT)remain;		/* Truncate btr by remaining bytes */
+	if (!btr) LEAVE_FF(fs, FR_OK);
+
+	if ((fp->fptr % SS(fs)) || (btr % SS(fs))) {
+		UINT br_fallback = 0;
+		res = f_read(fp, rbuff, btr, &br_fallback);
+		LEAVE_FF(fs, (res == FR_OK && br_fallback == btr) ? FR_OK : (res != FR_OK ? res : FR_DISK_ERR));
+	}
 
 	csize_bytes = fs->csize * SS(fs);
 	DWORD csect = (UINT)((fp->fptr / SS(fs)) & (fs->csize - 1));	/* Sector offset in the cluster */
-
-	/* If inside a cluster, read the sectors and align to cluster. */
-	if (csect) {
-		wbytes = MIN(btr, (fs->csize - csect) * SS(fs));
-		f_read(fp, wbuff, wbytes, (void *)0);
-		wbuff += wbytes;
-		btr -= wbytes;
-		if (!btr)
-			goto out;
-	}
 
 	if (!fp->fptr) {	/* On the top of the file? */
 		clst = fp->obj.sclust;	/* Follow from the origin */
@@ -3950,14 +3947,14 @@ FRESULT f_read_fast (
 
 	fp->clust = clst;	/* Set working cluster */
 
-	wbytes = MIN(btr, csize_bytes);
-	sector_base = clst2sect(fs, fp->clust);
-	count = wbytes / SS(fs);
-	fp->fptr += wbytes;
-	btr -= wbytes;
+	rbytes = MIN(btr, (fs->csize - csect) * SS(fs));
+	sector_base = clst2sect(fs, fp->clust) + csect;
+	count = rbytes / SS(fs);
+	fp->fptr += rbytes;
+	btr -= rbytes;
 
 	if (!btr) {	/* Final cluster/sectors read. */
-		if (disk_read(fs->pdrv, wbuff, sector_base, count) != RES_OK) ABORT(fs, FR_DISK_ERR);
+		if (disk_read(fs->pdrv, rbuff, sector_base, count) != RES_OK) ABORT(fs, FR_DISK_ERR);
 		goto out;
 	}
 
@@ -3970,21 +3967,21 @@ FRESULT f_read_fast (
 		fp->clust = clst;
 
 		work_sector = clst2sect(fs, fp->clust);
-		wbytes = MIN(btr, csize_bytes);
-		if ((work_sector - sector_base) == count) count += wbytes / SS(fs);
+		rbytes = MIN(btr, csize_bytes);
+		if ((work_sector - sector_base) == count) count += rbytes / SS(fs);
 		else {
-			if (disk_read(fs->pdrv, wbuff, sector_base, count) != RES_OK) ABORT(fs, FR_DISK_ERR);
-			wbuff += count * SS(fs);
+			if (disk_read(fs->pdrv, rbuff, sector_base, count) != RES_OK) ABORT(fs, FR_DISK_ERR);
+			rbuff += count * SS(fs);
 
 			sector_base = work_sector;
-			count = wbytes / SS(fs);
+			count = rbytes / SS(fs);
 		}
 
-		fp->fptr += wbytes;
-		btr -= wbytes;
+		fp->fptr += rbytes;
+		btr -= rbytes;
 
 		if (!btr) {	/* Final cluster/sectors read. */
-			if (disk_read(fs->pdrv, wbuff, sector_base, count) != RES_OK) ABORT(fs, FR_DISK_ERR);
+			if (disk_read(fs->pdrv, rbuff, sector_base, count) != RES_OK) ABORT(fs, FR_DISK_ERR);
 		}
 	}
 
@@ -4168,21 +4165,22 @@ FRESULT f_write_fast (
 	if ((!FF_FS_EXFAT || fs->fs_type != FS_EXFAT) && (DWORD)(fp->fptr + btw) < (DWORD)fp->fptr) {
 		btw = (UINT)(0xFFFFFFFF - (DWORD)fp->fptr);
 	}
+	if (!btw) LEAVE_FF(fs, FR_OK);
+
+	/* Never invoke f_write/f_sync on sector-aligned CLMT transfers:
+	 * computing clst2sect() + csect avoids mutating SD FAT/dir sectors and
+	 * avoids touching fs->win/fp->buf inside FS.kip's DMA buffer.
+	 */
+	if ((fp->fptr % SS(fs)) || (btw % SS(fs))) {
+		UINT bw_fallback = 0;
+		res = f_write(fp, wbuff, btw, &bw_fallback);
+		if (res == FR_OK)
+			res = f_sync(fp);
+		LEAVE_FF(fs, (res == FR_OK && bw_fallback == btw) ? FR_OK : (res != FR_OK ? res : FR_DISK_ERR));
+	}
 
 	csize_bytes = fs->csize * SS(fs);
 	DWORD csect = (UINT)((fp->fptr / SS(fs)) & (fs->csize - 1));	/* Sector offset in the cluster */
-
-	/* If inside a cluster, write the sectors and align to cluster. */
-	if (csect) {
-		wbytes = MIN(btw, (fs->csize - csect) * SS(fs));
-		f_write(fp, wbuff, wbytes, (void *)0);
-		/* Ensure flushing of it. FatFS is not notified for next write if raw. */
-		f_sync(fp);
-		wbuff += wbytes;
-		btw -= wbytes;
-		if (!btw)
-			goto out;
-	}
 
 	if (!fp->fptr) {	/* On the top of the file? */
 		clst = fp->obj.sclust;	/* Follow from the origin */
@@ -4196,8 +4194,8 @@ FRESULT f_write_fast (
 
 	fp->clust = clst;	/* Set working cluster */
 
-	wbytes = MIN(btw, csize_bytes);
-	sector_base = clst2sect(fs, fp->clust);
+	wbytes = MIN(btw, (fs->csize - csect) * SS(fs));
+	sector_base = clst2sect(fs, fp->clust) + csect;
 	count = wbytes / SS(fs);
 	fp->fptr += wbytes;
 	btw -= wbytes;
