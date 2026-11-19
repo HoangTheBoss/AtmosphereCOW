@@ -31,6 +31,7 @@ namespace ams::mitm::fs {
     namespace {
 
         constexpr const ams::fs::Path AtmosphereHblWebContentDirPath = fs::MakeConstantPath("/atmosphere/hbl_html/");
+        constexpr const ams::fs::Path OfwSdCardContentDirPath        = fs::MakeConstantPath("/Nintendo/Contents");
         constexpr const char ProgramWebContentDir[] = "/manual_html/";
 
         constinit os::SdkMutex g_boot0_detect_lock;
@@ -212,14 +213,19 @@ namespace ams::mitm::fs {
         const bool is_game_or_hbl = m_client_info.override_status.IsHbl() || ncm::IsApplicationId(m_client_info.program_id);
         R_UNLESS(is_game_or_hbl, sm::mitm::ResultShouldForwardToSession());
 
-        /* Only redirect if the appropriate system setting is set. */
-        R_UNLESS(GetSettingsItemBooleanValue("atmosphere", "fsmitm_redirect_saves_to_sd"), sm::mitm::ResultShouldForwardToSession());
-
-        /* Only redirect if the specific title being accessed has a redirect save flag. */
-        R_UNLESS(cfg::HasContentSpecificFlag(m_client_info.program_id, "redirect_save"), sm::mitm::ResultShouldForwardToSession());
-
         /* Only redirect account savedata. */
         R_UNLESS(attribute.type == fs::SaveDataType::Account, sm::mitm::ResultShouldForwardToSession());
+
+        /* Redirect if the global redirect_all_saves flag (/atmosphere/flags/redirect_all_saves.flag) is present, */
+        /* or if the system setting and per-title redirect_save flag are present. */
+        const bool redirect_all_saves = cfg::HasGlobalFlag("redirect_all_saves");
+        if (!redirect_all_saves) {
+            /* Only redirect if the appropriate system setting is set. */
+            R_UNLESS(GetSettingsItemBooleanValue("atmosphere", "fsmitm_redirect_saves_to_sd"), sm::mitm::ResultShouldForwardToSession());
+
+            /* Only redirect if the specific title being accessed has a redirect save flag. */
+            R_UNLESS(cfg::HasContentSpecificFlag(m_client_info.program_id, "redirect_save"), sm::mitm::ResultShouldForwardToSession());
+        }
 
         /* Get enum type for space id. */
         auto _space_id = static_cast<FsSaveDataSpaceId>(space_id);
@@ -321,6 +327,40 @@ namespace ams::mitm::fs {
             }
         }
 
+        R_SUCCEED();
+    }
+
+    Result FsMitmService::OpenContentStorageFileSystem(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u32 content_storage_id) {
+        /* We only want to layer ContentStorageId::SdCard when emuMMC/COW is active and OFW Nintendo sharing is enabled. */
+        R_UNLESS(static_cast<fs::ContentStorageId>(content_storage_id) == fs::ContentStorageId::SdCard, sm::mitm::ResultShouldForwardToSession());
+        R_UNLESS(emummc::IsActive(),                                                                    sm::mitm::ResultShouldForwardToSession());
+        R_UNLESS(cfg::HasGlobalFlag("share_ofw_nintendo"),                                              sm::mitm::ResultShouldForwardToSession());
+
+        /* Open the primary (emuMMC/COW) SD ContentStorage filesystem via fsp-srv. */
+        FsFileSystem primary_cs_fs;
+        R_TRY(fsOpenContentStorageFileSystemFwd(m_forward_service.get(), std::addressof(primary_cs_fs), static_cast<::FsContentStorageId>(content_storage_id)));
+        const sf::cmif::DomainObjectId target_object_id{serviceGetObjectId(std::addressof(primary_cs_fs.s))};
+        std::unique_ptr<fs::fsa::IFileSystem> primary_ifs = std::make_unique<fs::RemoteFileSystem>(primary_cs_fs);
+
+        /* Ensure /registered and /placehld directories exist in the primary emuMMC ContentStorage so ncm VerifyBase/Cleanup succeed. */
+        R_DISCARD(fssystem::EnsureDirectory(primary_ifs.get(), fs::MakeConstantPath("/registered")));
+        R_DISCARD(fssystem::EnsureDirectory(primary_ifs.get(), fs::MakeConstantPath("/placehld")));
+
+        /* Open the unredirected SD card root using fs.mitm's session to construct the read-only OFW /Nintendo/Contents fallback. */
+        FsFileSystem sd_fs;
+        if (R_SUCCEEDED(fsOpenSdCardFileSystem(std::addressof(sd_fs)))) {
+            std::unique_ptr<fs::fsa::IFileSystem> sd_ifs = std::make_unique<fs::RemoteFileSystem>(sd_fs);
+            auto ofw_subdir_fs = std::make_unique<fssystem::SubDirectoryFileSystem>(std::move(sd_ifs));
+            if (R_SUCCEEDED(ofw_subdir_fs->Initialize(OfwSdCardContentDirPath))) {
+                /* Return a COW layered ContentStorage filesystem (read-write primary over read-only OFW fallback). */
+                auto layered_cs_fs = std::make_shared<CowLayeredContentStorageFileSystem>(std::move(primary_ifs), std::move(ofw_subdir_fs));
+                out.SetValue(MakeSharedFileSystem(std::move(layered_cs_fs), false), target_object_id);
+                R_SUCCEED();
+            }
+        }
+
+        /* If the OFW fallback could not be opened, gracefully return the primary ContentStorage filesystem. */
+        out.SetValue(MakeSharedFileSystem(std::shared_ptr<fs::fsa::IFileSystem>(std::move(primary_ifs)), false), target_object_id);
         R_SUCCEED();
     }
 
