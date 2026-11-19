@@ -36,8 +36,8 @@ extern "C" {
 #include "../FS/FS.h"
 #include "../libs/fatfs/ff.h"
 
-#define EMUMMC_FILE_MAX_PARTS 32
-#define EMUMMC_FP_CLMT_COUNT  1024
+#define EMUMMC_FILE_MAX_PARTS 66
+#define EMUMMC_FP_CLMT_COUNT  512
 
 // FS typedefs
 typedef sdmmc_accessor_t *(*_sdmmc_accessor_gc)();

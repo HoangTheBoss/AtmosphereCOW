@@ -38,10 +38,19 @@ typedef struct sdmmc_accessor_vt
     uint64_t (*sdmmc_accessor_controller_open)(void *);
     uint64_t (*sdmmc_accessor_controller_close)(void *);
     uint64_t (*read_write)(void *, uint64_t, uint64_t, void *, uint64_t, uint64_t);
+    uint64_t (*check_connection)(void *, void *, void *);
+    uint64_t (*get_speed_mode)(void *, void *);
+    uint64_t (*get_memory_capacity)(void *, uint32_t *);
+    uint64_t (*get_device_status)(void *, uint32_t *);
+    uint64_t (*get_ocr)(void *, uint32_t *);
+    uint64_t (*get_rca)(void *, uint16_t *);
+    uint64_t (*get_cid)(void *, void *, uint64_t);
+    uint64_t (*get_csd)(void *, void *, uint64_t);
     // More not included because we don't use it.
 } sdmmc_accessor_vt_t;
 
 _Static_assert(__alignof(sdmmc_accessor_vt_t) == 8, "sdmmc_accessor_vt_t definition");
+_Static_assert(sizeof(sdmmc_accessor_vt_t) == 15 * sizeof(void *), "sdmmc_accessor_vt_t slot count");
 
 typedef struct
 {
