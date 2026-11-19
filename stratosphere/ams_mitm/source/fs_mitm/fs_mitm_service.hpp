@@ -24,6 +24,7 @@
     AMS_SF_METHOD_INFO(C, H,  18, Result, OpenSdCardFileSystem,                        (sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out),                                                                                                            (out))                                                                                    \
     AMS_SF_METHOD_INFO(C, H,  51, Result, OpenSaveDataFileSystem,                      (sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u8 space_id, const ams::fs::SaveDataAttribute &attribute),                                                  (out, space_id, attribute))                                                               \
     AMS_SF_METHOD_INFO(C, H,  12, Result, OpenBisStorage,                              (sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out, u32 bis_partition_id),                                                                                         (out, bis_partition_id))                                                                  \
+    AMS_SF_METHOD_INFO(C, H, 110, Result, OpenContentStorageFileSystem,                (sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u32 content_storage_id),                                                                                    (out, content_storage_id))                                                                \
     AMS_SF_METHOD_INFO(C, H, 200, Result, OpenDataStorageByCurrentProcess,             (sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out),                                                                                                               (out))                                                                                    \
     AMS_SF_METHOD_INFO(C, H, 201, Result, OpenDataStorageByProgramId,                  (sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out, ncm::ProgramId program_id),                                                                                    (out, program_id),                                                   hos::Version_3_0_0)  \
     AMS_SF_METHOD_INFO(C, H, 202, Result, OpenDataStorageByDataId,                     (sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out, ncm::DataId data_id, u8 storage_id),                                                                           (out, data_id, storage_id))                                                               \
@@ -52,6 +53,11 @@ namespace ams::mitm::fs {
 
                 /* We want to mitm ns, to intercept SD card requests and program index map info registration. */
                 if (program_id == ncm::SystemProgramId::Ns) {
+                    return true;
+                }
+
+                /* We want to mitm ncm, to support read-only fallback to OFW SD card content storage in emuMMC/COW mode. */
+                if (program_id == ncm::SystemProgramId::Ncm) {
                     return true;
                 }
 
@@ -90,6 +96,7 @@ namespace ams::mitm::fs {
             Result OpenSdCardFileSystem(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out);
             Result OpenSaveDataFileSystem(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u8 space_id, const ams::fs::SaveDataAttribute &attribute);
             Result OpenBisStorage(sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out, u32 bis_partition_id);
+            Result OpenContentStorageFileSystem(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u32 content_storage_id);
             Result OpenDataStorageByCurrentProcess(sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out);
             Result OpenDataStorageByProgramId(sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out, ncm::ProgramId program_id);
             Result OpenDataStorageByDataId(sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out, ncm::DataId data_id, u8 storage_id);
