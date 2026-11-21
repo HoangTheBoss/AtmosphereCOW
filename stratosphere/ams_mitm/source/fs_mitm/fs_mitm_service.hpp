@@ -56,7 +56,7 @@ namespace ams::mitm::fs {
                     return true;
                 }
 
-                /* We want to mitm ncm, to support read-only fallback to OFW SD card content storage in emuMMC/COW mode. */
+                /* We want to mitm ncm, to support read-only fallback to OFW SD card content storage and User content write-guard in emuMMC/COW mode. */
                 if (program_id == ncm::SystemProgramId::Ncm) {
                     return true;
                 }
