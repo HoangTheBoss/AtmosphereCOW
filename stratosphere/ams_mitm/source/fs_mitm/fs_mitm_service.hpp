@@ -41,6 +41,9 @@ AMS_SF_DEFINE_MITM_INTERFACE(ams::mitm::fs, IFsMitmInterface, AMS_FS_MITM_INTERF
 
 namespace ams::mitm::fs {
 
+    bool IsCowMmcActive();
+    bool HasCowOrGlobalFlag(const char *flag_file_name);
+
     class FsMitmService  : public sf::MitmServiceImplBase {
         public:
             using MitmServiceImplBase::MitmServiceImplBase;

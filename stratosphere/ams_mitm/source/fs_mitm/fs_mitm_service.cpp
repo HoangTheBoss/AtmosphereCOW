@@ -41,6 +41,7 @@ namespace ams::mitm::fs {
         constinit os::SdkMutex g_cow_user_probe_lock;
         constinit bool g_probed_cow_user = false;
         constinit bool g_is_cow_user = false;
+        constinit std::atomic_bool g_cow_boot_acknowledged = false;
 
         constinit fssrv::impl::ProgramIndexMapInfoManager g_program_index_map_info_manager;
 
@@ -217,28 +218,37 @@ namespace ams::mitm::fs {
         const bool is_game_or_hbl = m_client_info.override_status.IsHbl() || ncm::IsApplicationId(m_client_info.program_id);
         R_UNLESS(is_game_or_hbl, sm::mitm::ResultShouldForwardToSession());
 
-        /* Only redirect account savedata. */
-        R_UNLESS(attribute.type == fs::SaveDataType::Account, sm::mitm::ResultShouldForwardToSession());
+        /* On cowMMC, force Account + Device save redirection to <cow_path>/saves/... unless explicitly disabled. */
+        const bool force_cow_redirect = IsCowMmcActive() && !HasCowOrGlobalFlag("disable_save_redirect.flag");
+        const bool is_supported_type  = (attribute.type == fs::SaveDataType::Account) ||
+                                        (force_cow_redirect && attribute.type == fs::SaveDataType::Device);
+        R_UNLESS(is_supported_type, sm::mitm::ResultShouldForwardToSession());
 
-        /* Redirect if the global redirect_all_saves flag (/atmosphere/flags/redirect_all_saves.flag) is present, */
-        /* or if the system setting and per-title redirect_save flag are present. */
-        const bool redirect_all_saves = cfg::HasGlobalFlag("redirect_all_saves");
-        if (!redirect_all_saves) {
-            /* Only redirect if the appropriate system setting is set. */
-            R_UNLESS(GetSettingsItemBooleanValue("atmosphere", "fsmitm_redirect_saves_to_sd"), sm::mitm::ResultShouldForwardToSession());
+        if (!force_cow_redirect) {
+            /* Redirect if the global redirect_all_saves flag (/atmosphere/flags/redirect_all_saves.flag) is present, */
+            /* or if the system setting and per-title redirect_save flag are present. */
+            const bool redirect_all_saves = cfg::HasGlobalFlag("redirect_all_saves");
+            if (!redirect_all_saves) {
+                /* Only redirect if the appropriate system setting is set. */
+                R_UNLESS(GetSettingsItemBooleanValue("atmosphere", "fsmitm_redirect_saves_to_sd"), sm::mitm::ResultShouldForwardToSession());
 
-            /* Only redirect if the specific title being accessed has a redirect save flag. */
-            R_UNLESS(cfg::HasContentSpecificFlag(m_client_info.program_id, "redirect_save"), sm::mitm::ResultShouldForwardToSession());
+                /* Only redirect if the specific title being accessed has a redirect save flag. */
+                R_UNLESS(cfg::HasContentSpecificFlag(m_client_info.program_id, "redirect_save"), sm::mitm::ResultShouldForwardToSession());
+            }
         }
 
         /* Get enum type for space id. */
         auto _space_id = static_cast<FsSaveDataSpaceId>(space_id);
 
-        /* Verify we can open the save. */
+        /* Verify we can open the save on BIS (or fall back to existing SD save directory after a cowMMC re-baseline). */
         static_assert(sizeof(fs::SaveDataAttribute) == sizeof(::FsSaveDataAttribute));
         FsFileSystem save_fs;
-        R_UNLESS(R_SUCCEEDED(fsOpenSaveDataFileSystemFwd(m_forward_service.get(), std::addressof(save_fs), _space_id, reinterpret_cast<const FsSaveDataAttribute *>(std::addressof(attribute)))), sm::mitm::ResultShouldForwardToSession());
-        std::unique_ptr<fs::fsa::IFileSystem> save_ifs = std::make_unique<fs::RemoteFileSystem>(save_fs);
+        std::unique_ptr<fs::fsa::IFileSystem> save_ifs = nullptr;
+        const bool has_bis_save = R_SUCCEEDED(fsOpenSaveDataFileSystemFwd(m_forward_service.get(), std::addressof(save_fs), _space_id, reinterpret_cast<const FsSaveDataAttribute *>(std::addressof(attribute))));
+        R_UNLESS(has_bis_save || force_cow_redirect, sm::mitm::ResultShouldForwardToSession());
+        if (has_bis_save) {
+            save_ifs = std::make_unique<fs::RemoteFileSystem>(save_fs);
+        }
 
         /* Mount the SD card using fs.mitm's session. */
         FsFileSystem sd_fs;
@@ -265,6 +275,9 @@ namespace ams::mitm::fs {
             } R_END_TRY_CATCH;
         }
 
+        /* If neither BIS nor the SD save directory has this save yet, forward to fsp-srv so standard creation runs. */
+        R_UNLESS(!is_new_save || save_ifs != nullptr, sm::mitm::ResultShouldForwardToSession());
+
         /* Ensure the directory exists. */
         R_TRY(fssystem::EnsureDirectory(sd_ifs.get(), save_dir_path));
 
@@ -278,7 +291,7 @@ namespace ams::mitm::fs {
         R_TRY(dirsave_ifs->Initialize(true, true, true));
 
         /* If it's the first time we're making the save, copy existing savedata over. */
-        if (is_new_save) {
+        if (is_new_save && save_ifs != nullptr) {
             /* TODO: Check error? */
             fs::DirectoryEntry work_entry;
             constexpr const fs::Path root_path = fs::MakeConstantPath("/");
@@ -334,17 +347,9 @@ namespace ams::mitm::fs {
         R_SUCCEED();
     }
 
-    bool ShouldBlockUserContentWrites() {
+    bool IsCowMmcActive() {
         if (!emummc::IsActive()) {
             return false;
-        }
-
-        if (mitm::fs::HasSdFile("/atmosphere/flags/allow_user_content_install.flag")) {
-            return false;
-        }
-
-        if (mitm::fs::HasSdFile("/atmosphere/flags/block_user_content_install.flag")) {
-            return true;
         }
 
         /* Fast check: "COW0".."COW9" IDs generated by provision_cow_sd / Hekate / libsys_cow ("COW\0" LE). */
@@ -360,14 +365,15 @@ namespace ams::mitm::fs {
         }
 
         const char *file_path = emummc::GetFilePath();
-        if (file_path == nullptr) {
+        if (file_path == nullptr || file_path[0] == '\0') {
             g_is_cow_user = false;
             g_probed_cow_user = true;
             return false;
         }
 
+        const char *rel_base = (file_path[0] == '/') ? (file_path + 1) : file_path;
         char part0_path[ams::fs::EntryNameLengthMax + 1];
-        util::SNPrintf(part0_path, sizeof(part0_path), "%s/eMMC/00", file_path);
+        util::SNPrintf(part0_path, sizeof(part0_path), "/%s/eMMC/00", rel_base);
 
         FsFile file;
         const Result open_res = mitm::fs::OpenSdFile(std::addressof(file), part0_path, ams::fs::OpenMode_Read);
@@ -398,6 +404,91 @@ namespace ams::mitm::fs {
         g_is_cow_user = is_cow;
         g_probed_cow_user = true;
         return g_is_cow_user;
+    }
+
+    bool HasCowOrGlobalFlag(const char *flag_file_name) {
+        if (flag_file_name == nullptr || flag_file_name[0] == '\0') {
+            return false;
+        }
+
+        if (emummc::IsActive()) {
+            const char *file_path = emummc::GetFilePath();
+            if (file_path != nullptr && file_path[0] != '\0') {
+                const char *rel_base = (file_path[0] == '/') ? (file_path + 1) : file_path;
+                char overlay_flag_path[ams::fs::EntryNameLengthMax + 1];
+                util::SNPrintf(overlay_flag_path, sizeof(overlay_flag_path), "/%s/%s", rel_base, flag_file_name);
+                if (mitm::fs::HasSdFile(overlay_flag_path)) {
+                    return true;
+                }
+            }
+        }
+
+        char global_flag_path[ams::fs::EntryNameLengthMax + 1];
+        util::SNPrintf(global_flag_path, sizeof(global_flag_path), "/atmosphere/flags/%s", flag_file_name);
+        return mitm::fs::HasSdFile(global_flag_path);
+    }
+
+    bool ShouldBlockUserContentWrites() {
+        if (!emummc::IsActive()) {
+            return false;
+        }
+
+        if (HasCowOrGlobalFlag("allow_user_content_install.flag")) {
+            return false;
+        }
+
+        if (HasCowOrGlobalFlag("block_user_content_install.flag")) {
+            return true;
+        }
+
+        return IsCowMmcActive();
+    }
+
+    namespace {
+
+        void MaybeAcknowledgeCowBoot(ncm::ProgramId client_program_id) {
+            if (AMS_LIKELY(g_cow_boot_acknowledged)) {
+                return;
+            }
+            if (client_program_id != ncm::SystemAppletId::Qlaunch &&
+                client_program_id != ncm::SystemAppletId::MaintenanceMenu) {
+                return;
+            }
+            if (!mitm::IsInitialized()) {
+                return;
+            }
+            if (!IsCowMmcActive()) {
+                g_cow_boot_acknowledged = true;
+                return;
+            }
+
+            const char *file_path = emummc::GetFilePath();
+            if (file_path == nullptr || file_path[0] == '\0') {
+                g_cow_boot_acknowledged = true;
+                return;
+            }
+
+            const char *rel_base = (file_path[0] == '/') ? (file_path + 1) : file_path;
+            char pend_path[ams::fs::EntryNameLengthMax + 1];
+            char ok_path[ams::fs::EntryNameLengthMax + 1];
+            util::SNPrintf(pend_path, sizeof(pend_path), "/%s/boot_pending", rel_base);
+            util::SNPrintf(ok_path, sizeof(ok_path), "/%s/boot_ok", rel_base);
+
+            const Result del_res = mitm::fs::DeleteSdFile(pend_path);
+            if (ams::fs::ResultSdCardNotPresent::Includes(del_res)) {
+                return;
+            }
+
+            if (!mitm::fs::HasSdFile(ok_path)) {
+                const Result cr_res = mitm::fs::CreateSdFile(ok_path, 0, ams::fs::CreateOption_None);
+                if (ams::fs::ResultSdCardNotPresent::Includes(cr_res)) {
+                    return;
+                }
+            }
+
+            g_cow_boot_acknowledged = true;
+        }
+
     }
 
     Result FsMitmService::OpenContentStorageFileSystem(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u32 content_storage_id) {
@@ -448,6 +539,8 @@ namespace ams::mitm::fs {
     }
 
     Result FsMitmService::OpenDataStorageByCurrentProcess(sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out) {
+        MaybeAcknowledgeCowBoot(m_client_info.program_id);
+
         /* Only mitm if we should override contents for the current process. */
         R_UNLESS(m_client_info.override_status.IsProgramSpecific(),     sm::mitm::ResultShouldForwardToSession());
 
@@ -532,6 +625,8 @@ namespace ams::mitm::fs {
     }
     
     Result FsMitmService::OpenDataStorageByCurrentProcessForBatchRead(sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorageForBatchRead>> out) {
+        MaybeAcknowledgeCowBoot(m_client_info.program_id);
+
         /* Only mitm if we should override contents for the current process. */
         R_UNLESS(m_client_info.override_status.IsProgramSpecific(),     sm::mitm::ResultShouldForwardToSession());
 
