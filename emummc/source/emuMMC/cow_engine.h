@@ -83,7 +83,7 @@ typedef struct __attribute__((packed)) {
     uint32_t magic;                      /* 0x000: COW_MAGIC ("COW0") */
     uint32_t version;                    /* 0x004: COW_VERSION_V2 (2) */
     uint64_t seq_num;                    /* 0x008: Monotonically increasing commit sequence number */
-    uint64_t gpp_total_sectors;          /* 0x010: Virtual GPP sectors exposed to HOS (>= physical_base_sectors) */
+    uint64_t gpp_total_sectors;          /* 0x010: Physical GPP sectors exposed to HOS (must equal physical_base_sectors) */
     uint32_t prefix_sectors;             /* 0x018: Sectors routed to /eMMC/00 (e.g., 65536 = 32 MiB) */
     uint32_t total_slots;                /* 0x01C: Currently backed 16 KiB slots in /eMMC/00..NN */
     uint32_t next_free_slot;             /* 0x020: Next unallocated 16 KiB slot index */
@@ -174,7 +174,7 @@ typedef struct {
     uint64_t           lru_tick;
 
     /* Resolved runtime geometry */
-    uint64_t           physical_base_sectors; /* Clean reads >= this return deterministic zeros */
+    uint64_t           physical_base_sectors; /* Underlying physical eMMC GPP sectors (matches gpp_total_sectors) */
     uint32_t           effective_total_slots; /* min(backing_slots, total_slots, max_overlay_slots) */
     uint32_t           active_l1_entries;     /* 1024..8192 */
     uint32_t           active_first_data_slot;/* l1_slot_b + ceil(l1_bytes/16K) */

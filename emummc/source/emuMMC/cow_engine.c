@@ -87,7 +87,7 @@ static bool _validate_header_integrity(
     if (hdr->l1_entries < COW_MIN_L1_ENTRIES || hdr->l1_entries > COW_L1_ENTRIES)
         return false;
 
-    if (hdr->gpp_total_sectors < hdr->physical_base_sectors)
+    if (hdr->physical_base_sectors == 0ULL || hdr->gpp_total_sectors != hdr->physical_base_sectors)
         return false;
 
     if (!_validate_v2_slots(hdr))
@@ -292,7 +292,13 @@ bool cow_engine_format_v2(
         return false;
     hdr.l2_shift = COW_L2_SHIFT;
 
-    if (hdr.gpp_total_sectors == 0ULL || hdr.gpp_total_sectors < hdr.physical_base_sectors)
+    if (hdr.gpp_total_sectors == 0ULL)
+        return false;
+
+    if (hdr.physical_base_sectors == 0ULL)
+        hdr.physical_base_sectors = hdr.gpp_total_sectors;
+
+    if (hdr.gpp_total_sectors != hdr.physical_base_sectors)
         return false;
 
     if (hdr.l1_entries == 0U) {
@@ -547,10 +553,9 @@ static uint32_t _lookup_block_slot(cow_engine_t *eng, uint32_t block_idx)
     return way->entries[l2_idx];
 }
 
-/* Read clean (unmodified) sectors across 3 spans:
+/* Read clean (unmodified) sectors across 2 physical spans:
  * 1) [sector, min(end, prefix_sectors))               -> io.read_prefix
  * 2) [max(sector, prefix_sectors), min(end, base))    -> io.read_base_gpp
- * 3) [max(sector, physical_base_sectors), end)        -> deterministic zero-fill
  */
 static bool _read_clean_gpp_span(cow_engine_t *eng, uint32_t sector, uint32_t num_sectors, void *buf)
 {
@@ -583,10 +588,8 @@ static bool _read_clean_gpp_span(cow_engine_t *eng, uint32_t sector, uint32_t nu
         sector += base_cnt;
     }
 
-    if ((uint64_t)sector < end) {
-        uint32_t zero_cnt = (uint32_t)(end - sector);
-        memset(out, 0, (size_t)zero_cnt * COW_SECTOR_SIZE);
-    }
+    if ((uint64_t)sector < end)
+        return false;
 
     return true;
 }

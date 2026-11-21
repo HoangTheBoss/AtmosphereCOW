@@ -61,68 +61,6 @@ static uint32_t g_cow_base_sector = COW_DEFAULT_PREFIX_SECTS;
 static uint64_t g_raw_file_total_sect = 0;
 static uint8_t g_dma_save_buf[COW_BLOCK_BYTES] __attribute__((aligned(16)));
 
-typedef struct {
-    sdmmc_accessor_vt_t vt;
-    void *ext[8]; /* Preserve GetAndClearErrorInfo + BaseDeviceAccessor virtuals (OnActivate/OnReadWrite/ReStartup) */
-} cow_nand_vtab_shadow_t;
-
-_Static_assert(offsetof(cow_nand_vtab_shadow_t, vt) == 0, "cow_nand_vtab_shadow_t layout");
-
-static cow_nand_vtab_shadow_t g_cow_nand_vtab;
-static bool g_cow_nand_vtab_installed = false;
-
-static uint64_t _cow_nand_get_memory_capacity(void *_this, uint32_t *out_sectors)
-{
-    (void)_this;
-    if (out_sectors != NULL)
-        *out_sectors = (uint32_t)g_cow_engine.hdr.gpp_total_sectors;
-    return 0;
-}
-
-static bool _cow_ptr_has_perm(uintptr_t ptr, size_t len, u32 required_perm)
-{
-    if (ptr < 0x10000ULL)
-        return false;
-    MemoryInfo mi;
-    u32 pi = 0;
-    if (svcQueryMemory(&mi, &pi, (u64)ptr) != 0)
-        return false;
-    if ((mi.perm & required_perm) != required_perm)
-        return false;
-    if ((u64)ptr < mi.addr || ((u64)ptr - mi.addr) + (u64)len > mi.size)
-        return false;
-    return true;
-}
-
-static void _cow_apply_capacity_override(sdmmc_accessor_t *_this)
-{
-    if (_this != NULL &&
-        g_cow_engine.initialized &&
-        g_cow_engine.hdr.gpp_total_sectors > g_cow_engine.physical_base_sectors)
-    {
-        if (_cow_ptr_has_perm((uintptr_t)_this->vtab, sizeof(g_cow_nand_vtab), Perm_R))
-        {
-            if (!g_cow_nand_vtab_installed)
-            {
-                memcpy(&g_cow_nand_vtab, _this->vtab, sizeof(g_cow_nand_vtab));
-                g_cow_nand_vtab.vt.get_memory_capacity = _cow_nand_get_memory_capacity;
-                g_cow_nand_vtab_installed = true;
-            }
-            _this->vtab = &g_cow_nand_vtab.vt;
-        }
-
-        uintptr_t base_dev_ptr = 0;
-        if (_cow_ptr_has_perm((uintptr_t)_this + 0x10, sizeof(uintptr_t), Perm_R))
-            base_dev_ptr = *(const uintptr_t *)((uintptr_t)_this + 0x10);
-        if (_cow_ptr_has_perm(base_dev_ptr, 0x30, Perm_Rw))
-        {
-            uint32_t *base_dev = (uint32_t *)base_dev_ptr;
-            if (base_dev[0x24 / 4] == (uint32_t)g_cow_engine.physical_base_sectors)
-                base_dev[0x24 / 4] = (uint32_t)g_cow_engine.hdr.gpp_total_sectors;
-        }
-    }
-}
-
 static bool _file_based_gpp_raw_rw_inner(void *buf, unsigned int sector, unsigned int num_sectors, bool is_write)
 {
     FIL *fp = NULL;
@@ -529,7 +467,7 @@ static void _file_based_emmc_initialize(void)
             if (!cow_engine_init_bounded(&g_cow_engine, &cow_io, avail_slots, true))
                 fatal_abort(Fatal_FatfsFileOpen);
 
-            // Expose the full virtual GPP sector count to FS.kip & NAND Patrol
+            // Expose physical GPP sector count to FS.kip & NAND Patrol
             f_emu.total_sect = g_cow_engine.hdr.gpp_total_sectors;
         }
     }
@@ -690,9 +628,6 @@ uint64_t sdmmc_wrapper_controller_open(int mmc_id)
 
         result = _this->vtab->sdmmc_accessor_controller_open(_this);
 
-        if (mmc_id == FS_SDMMC_EMMC && result == 0)
-            _cow_apply_capacity_override(_this);
-
         // Unlock eMMC.
         if (mmc_id == FS_SDMMC_SD)
             mutex_unlock_handler(FS_SDMMC_EMMC);
@@ -755,8 +690,6 @@ uint64_t sdmmc_wrapper_read(void *buf, uint64_t bufSize, int mmc_id, unsigned in
 
         if (mmc_id == FS_SDMMC_EMMC)
         {
-            _cow_apply_capacity_override(_this);
-
             // Call hekates driver.
             if (emummc_read_write_inner(buf, sector, num_sectors, false))
             {
@@ -817,7 +750,6 @@ uint64_t sdmmc_wrapper_write(int mmc_id, unsigned int sector, unsigned int num_s
         {
             mutex_lock_handler(mmc_id);
             _current_accessor = _this;
-            _cow_apply_capacity_override(_this);
 
             // Call hekates driver.
             if (emummc_read_write_inner(buf, sector, num_sectors, true))
