@@ -41,6 +41,9 @@ AMS_SF_DEFINE_MITM_INTERFACE(ams::mitm::fs, IFsMitmInterface, AMS_FS_MITM_INTERF
 
 namespace ams::mitm::fs {
 
+    bool IsCowMmcActive();
+    bool HasCowOrGlobalFlag(const char *flag_file_name);
+
     class FsMitmService  : public sf::MitmServiceImplBase {
         public:
             using MitmServiceImplBase::MitmServiceImplBase;
@@ -56,7 +59,7 @@ namespace ams::mitm::fs {
                     return true;
                 }
 
-                /* We want to mitm ncm, to support read-only fallback to OFW SD card content storage in emuMMC/COW mode. */
+                /* We want to mitm ncm, to support read-only fallback to OFW SD card content storage and User content write-guard in emuMMC/COW mode. */
                 if (program_id == ncm::SystemProgramId::Ncm) {
                     return true;
                 }
