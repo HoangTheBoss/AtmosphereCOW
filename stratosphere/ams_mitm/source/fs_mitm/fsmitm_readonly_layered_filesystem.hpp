@@ -14,6 +14,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #pragma once
+#include <cstring>
 #include <stratosphere.hpp>
 
 namespace ams::mitm::fs {
@@ -188,6 +189,120 @@ namespace ams::mitm::fs {
 
             virtual Result DoQueryEntry(char *dst, size_t dst_size, const char *src, size_t src_size, ams::fs::fsa::QueryId query, const ams::fs::Path &path) override final {
                 R_RETURN(m_primary_fs->QueryEntry(dst, dst_size, src, src_size, query, path));
+            }
+    };
+
+    bool ShouldBlockUserContentWrites();
+
+    /*
+     * ContentStorageId::User Write-Guard FileSystem for cowMMC:
+     *   - Preserves all reads, directory listings, and content deletions/cleanup
+     *     so existing sysNAND titles launch and ncm startup/cleanup never fail.
+     *   - When ShouldBlockUserContentWrites() is true, reports 0 B free space
+     *     and rejects new files, non-base directories, write-mode opens, and
+     *     renames with fs::ResultNotEnoughFreeSpaceBisUser() so installers and
+     *     HOS route new titles to SD Card while leaving USER:/save/ writable.
+     */
+    class CowUserContentStorageFileSystem : public ams::fs::fsa::IFileSystem {
+        private:
+            std::unique_ptr<ams::fs::fsa::IFileSystem> m_base_fs;
+        private:
+            static bool IsNcmBaseDirPath(const ams::fs::Path &path) {
+                const char *str = path.GetString();
+                return std::strcmp(str, "/") == 0 || std::strcmp(str, "/registered") == 0 || std::strcmp(str, "/placehld") == 0;
+            }
+        public:
+            explicit CowUserContentStorageFileSystem(std::unique_ptr<ams::fs::fsa::IFileSystem> base_fs)
+                : m_base_fs(std::move(base_fs)) { /* ... */ }
+
+            virtual ~CowUserContentStorageFileSystem() { /* ... */ }
+        private:
+            virtual Result DoCreateFile(const ams::fs::Path &path, s64 size, int flags) override final {
+                if (ShouldBlockUserContentWrites()) {
+                    AMS_UNUSED(path, size, flags);
+                    R_THROW(ams::fs::ResultNotEnoughFreeSpaceBisUser());
+                }
+                R_RETURN(m_base_fs->CreateFile(path, size, flags));
+            }
+
+            virtual Result DoDeleteFile(const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->DeleteFile(path));
+            }
+
+            virtual Result DoCreateDirectory(const ams::fs::Path &path) override final {
+                if (!IsNcmBaseDirPath(path) && ShouldBlockUserContentWrites()) {
+                    R_THROW(ams::fs::ResultNotEnoughFreeSpaceBisUser());
+                }
+                R_RETURN(m_base_fs->CreateDirectory(path));
+            }
+
+            virtual Result DoDeleteDirectory(const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->DeleteDirectory(path));
+            }
+
+            virtual Result DoDeleteDirectoryRecursively(const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->DeleteDirectoryRecursively(path));
+            }
+
+            virtual Result DoRenameFile(const ams::fs::Path &old_path, const ams::fs::Path &new_path) override final {
+                if (ShouldBlockUserContentWrites()) {
+                    AMS_UNUSED(old_path, new_path);
+                    R_THROW(ams::fs::ResultNotEnoughFreeSpaceBisUser());
+                }
+                R_RETURN(m_base_fs->RenameFile(old_path, new_path));
+            }
+
+            virtual Result DoRenameDirectory(const ams::fs::Path &old_path, const ams::fs::Path &new_path) override final {
+                if (ShouldBlockUserContentWrites()) {
+                    AMS_UNUSED(old_path, new_path);
+                    R_THROW(ams::fs::ResultNotEnoughFreeSpaceBisUser());
+                }
+                R_RETURN(m_base_fs->RenameDirectory(old_path, new_path));
+            }
+
+            virtual Result DoGetEntryType(ams::fs::DirectoryEntryType *out, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->GetEntryType(out, path));
+            }
+
+            virtual Result DoOpenFile(std::unique_ptr<ams::fs::fsa::IFile> *out_file, const ams::fs::Path &path, ams::fs::OpenMode mode) override final {
+                if ((mode & ams::fs::OpenMode_All) != ams::fs::OpenMode_Read && ShouldBlockUserContentWrites()) {
+                    AMS_UNUSED(out_file, path);
+                    R_THROW(ams::fs::ResultNotEnoughFreeSpaceBisUser());
+                }
+                R_RETURN(m_base_fs->OpenFile(out_file, path, mode));
+            }
+
+            virtual Result DoOpenDirectory(std::unique_ptr<ams::fs::fsa::IDirectory> *out_dir, const ams::fs::Path &path, ams::fs::OpenDirectoryMode mode) override final {
+                R_RETURN(m_base_fs->OpenDirectory(out_dir, path, mode));
+            }
+
+            virtual Result DoCommit() override final {
+                R_RETURN(m_base_fs->Commit());
+            }
+
+            virtual Result DoGetFreeSpaceSize(s64 *out, const ams::fs::Path &path) override final {
+                if (ShouldBlockUserContentWrites()) {
+                    AMS_UNUSED(path);
+                    *out = 0;
+                    R_SUCCEED();
+                }
+                R_RETURN(m_base_fs->GetFreeSpaceSize(out, path));
+            }
+
+            virtual Result DoGetTotalSpaceSize(s64 *out, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->GetTotalSpaceSize(out, path));
+            }
+
+            virtual Result DoCleanDirectoryRecursively(const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->CleanDirectoryRecursively(path));
+            }
+
+            virtual Result DoGetFileTimeStampRaw(ams::fs::FileTimeStampRaw *out, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->GetFileTimeStampRaw(out, path));
+            }
+
+            virtual Result DoQueryEntry(char *dst, size_t dst_size, const char *src, size_t src_size, ams::fs::fsa::QueryId query, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->QueryEntry(dst, dst_size, src, src_size, query, path));
             }
     };
 
