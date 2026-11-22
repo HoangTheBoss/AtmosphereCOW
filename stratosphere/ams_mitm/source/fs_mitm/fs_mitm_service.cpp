@@ -217,28 +217,37 @@ namespace ams::mitm::fs {
         const bool is_game_or_hbl = m_client_info.override_status.IsHbl() || ncm::IsApplicationId(m_client_info.program_id);
         R_UNLESS(is_game_or_hbl, sm::mitm::ResultShouldForwardToSession());
 
-        /* Only redirect account savedata. */
-        R_UNLESS(attribute.type == fs::SaveDataType::Account, sm::mitm::ResultShouldForwardToSession());
+        /* On cowMMC, force Account + Device save redirection to <cow_path>/saves/... unless explicitly disabled. */
+        const bool force_cow_redirect = IsCowMmcActive() && !HasCowOrGlobalFlag("disable_save_redirect.flag");
+        const bool is_supported_type  = (attribute.type == fs::SaveDataType::Account) ||
+                                        (force_cow_redirect && attribute.type == fs::SaveDataType::Device);
+        R_UNLESS(is_supported_type, sm::mitm::ResultShouldForwardToSession());
 
-        /* Redirect if the global redirect_all_saves flag (/atmosphere/flags/redirect_all_saves.flag) is present, */
-        /* or if the system setting and per-title redirect_save flag are present. */
-        const bool redirect_all_saves = cfg::HasGlobalFlag("redirect_all_saves");
-        if (!redirect_all_saves) {
-            /* Only redirect if the appropriate system setting is set. */
-            R_UNLESS(GetSettingsItemBooleanValue("atmosphere", "fsmitm_redirect_saves_to_sd"), sm::mitm::ResultShouldForwardToSession());
+        if (!force_cow_redirect) {
+            /* Redirect if the global redirect_all_saves flag (/atmosphere/flags/redirect_all_saves.flag) is present, */
+            /* or if the system setting and per-title redirect_save flag are present. */
+            const bool redirect_all_saves = cfg::HasGlobalFlag("redirect_all_saves");
+            if (!redirect_all_saves) {
+                /* Only redirect if the appropriate system setting is set. */
+                R_UNLESS(GetSettingsItemBooleanValue("atmosphere", "fsmitm_redirect_saves_to_sd"), sm::mitm::ResultShouldForwardToSession());
 
-            /* Only redirect if the specific title being accessed has a redirect save flag. */
-            R_UNLESS(cfg::HasContentSpecificFlag(m_client_info.program_id, "redirect_save"), sm::mitm::ResultShouldForwardToSession());
+                /* Only redirect if the specific title being accessed has a redirect save flag. */
+                R_UNLESS(cfg::HasContentSpecificFlag(m_client_info.program_id, "redirect_save"), sm::mitm::ResultShouldForwardToSession());
+            }
         }
 
         /* Get enum type for space id. */
         auto _space_id = static_cast<FsSaveDataSpaceId>(space_id);
 
-        /* Verify we can open the save. */
+        /* Verify we can open the save on BIS (or fall back to existing SD save directory after a cowMMC re-baseline). */
         static_assert(sizeof(fs::SaveDataAttribute) == sizeof(::FsSaveDataAttribute));
         FsFileSystem save_fs;
-        R_UNLESS(R_SUCCEEDED(fsOpenSaveDataFileSystemFwd(m_forward_service.get(), std::addressof(save_fs), _space_id, reinterpret_cast<const FsSaveDataAttribute *>(std::addressof(attribute)))), sm::mitm::ResultShouldForwardToSession());
-        std::unique_ptr<fs::fsa::IFileSystem> save_ifs = std::make_unique<fs::RemoteFileSystem>(save_fs);
+        std::unique_ptr<fs::fsa::IFileSystem> save_ifs = nullptr;
+        const bool has_bis_save = R_SUCCEEDED(fsOpenSaveDataFileSystemFwd(m_forward_service.get(), std::addressof(save_fs), _space_id, reinterpret_cast<const FsSaveDataAttribute *>(std::addressof(attribute))));
+        R_UNLESS(has_bis_save || force_cow_redirect, sm::mitm::ResultShouldForwardToSession());
+        if (has_bis_save) {
+            save_ifs = std::make_unique<fs::RemoteFileSystem>(save_fs);
+        }
 
         /* Mount the SD card using fs.mitm's session. */
         FsFileSystem sd_fs;
@@ -265,6 +274,9 @@ namespace ams::mitm::fs {
             } R_END_TRY_CATCH;
         }
 
+        /* If neither BIS nor the SD save directory has this save yet, forward to fsp-srv so standard creation runs. */
+        R_UNLESS(!is_new_save || save_ifs != nullptr, sm::mitm::ResultShouldForwardToSession());
+
         /* Ensure the directory exists. */
         R_TRY(fssystem::EnsureDirectory(sd_ifs.get(), save_dir_path));
 
@@ -278,7 +290,7 @@ namespace ams::mitm::fs {
         R_TRY(dirsave_ifs->Initialize(true, true, true));
 
         /* If it's the first time we're making the save, copy existing savedata over. */
-        if (is_new_save) {
+        if (is_new_save && save_ifs != nullptr) {
             /* TODO: Check error? */
             fs::DirectoryEntry work_entry;
             constexpr const fs::Path root_path = fs::MakeConstantPath("/");
