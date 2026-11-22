@@ -41,6 +41,7 @@ namespace ams::mitm::fs {
         constinit os::SdkMutex g_cow_user_probe_lock;
         constinit bool g_probed_cow_user = false;
         constinit bool g_is_cow_user = false;
+        constinit std::atomic_bool g_cow_boot_acknowledged = false;
 
         constinit fssrv::impl::ProgramIndexMapInfoManager g_program_index_map_info_manager;
 
@@ -443,6 +444,53 @@ namespace ams::mitm::fs {
         return IsCowMmcActive();
     }
 
+    namespace {
+
+        void MaybeAcknowledgeCowBoot(ncm::ProgramId client_program_id) {
+            if (AMS_LIKELY(g_cow_boot_acknowledged)) {
+                return;
+            }
+            if (client_program_id != ncm::SystemAppletId::Qlaunch &&
+                client_program_id != ncm::SystemAppletId::MaintenanceMenu) {
+                return;
+            }
+            if (!mitm::IsInitialized()) {
+                return;
+            }
+            if (!IsCowMmcActive()) {
+                g_cow_boot_acknowledged = true;
+                return;
+            }
+
+            const char *file_path = emummc::GetFilePath();
+            if (file_path == nullptr || file_path[0] == '\0') {
+                g_cow_boot_acknowledged = true;
+                return;
+            }
+
+            const char *rel_base = (file_path[0] == '/') ? (file_path + 1) : file_path;
+            char pend_path[ams::fs::EntryNameLengthMax + 1];
+            char ok_path[ams::fs::EntryNameLengthMax + 1];
+            util::SNPrintf(pend_path, sizeof(pend_path), "/%s/boot_pending", rel_base);
+            util::SNPrintf(ok_path, sizeof(ok_path), "/%s/boot_ok", rel_base);
+
+            const Result del_res = mitm::fs::DeleteSdFile(pend_path);
+            if (ams::fs::ResultSdCardNotPresent::Includes(del_res)) {
+                return;
+            }
+
+            if (!mitm::fs::HasSdFile(ok_path)) {
+                const Result cr_res = mitm::fs::CreateSdFile(ok_path, 0, ams::fs::CreateOption_None);
+                if (ams::fs::ResultSdCardNotPresent::Includes(cr_res)) {
+                    return;
+                }
+            }
+
+            g_cow_boot_acknowledged = true;
+        }
+
+    }
+
     Result FsMitmService::OpenContentStorageFileSystem(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u32 content_storage_id) {
         R_UNLESS(emummc::IsActive(), sm::mitm::ResultShouldForwardToSession());
 
@@ -491,6 +539,8 @@ namespace ams::mitm::fs {
     }
 
     Result FsMitmService::OpenDataStorageByCurrentProcess(sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out) {
+        MaybeAcknowledgeCowBoot(m_client_info.program_id);
+
         /* Only mitm if we should override contents for the current process. */
         R_UNLESS(m_client_info.override_status.IsProgramSpecific(),     sm::mitm::ResultShouldForwardToSession());
 
@@ -575,6 +625,8 @@ namespace ams::mitm::fs {
     }
     
     Result FsMitmService::OpenDataStorageByCurrentProcessForBatchRead(sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorageForBatchRead>> out) {
+        MaybeAcknowledgeCowBoot(m_client_info.program_id);
+
         /* Only mitm if we should override contents for the current process. */
         R_UNLESS(m_client_info.override_status.IsProgramSpecific(),     sm::mitm::ResultShouldForwardToSession());
 
