@@ -20,6 +20,8 @@
 
 #include "emummc.h"
 #include "emummc_ctx.h"
+#include "cow_engine.h"
+#include "../nx/svc.h"
 #include "../utils/fatal.h"
 #include "../libs/fatfs/diskio.h"
 
@@ -52,6 +54,196 @@ volatile Handle *sdmmc_das_handle;
 // FatFS
 file_based_ctxt f_emu;
 static bool fat_mounted = false;
+
+// cowMMC state
+static cow_engine_t g_cow_engine;
+static uint32_t g_cow_base_sector = COW_DEFAULT_PREFIX_SECTS;
+static uint64_t g_raw_file_total_sect = 0;
+static uint8_t g_dma_save_buf[COW_BLOCK_BYTES] __attribute__((aligned(16)));
+
+static bool _file_based_gpp_raw_rw_inner(void *buf, unsigned int sector, unsigned int num_sectors, bool is_write)
+{
+    FIL *fp = NULL;
+
+    if (__builtin_expect((uint64_t)sector + num_sectors > g_raw_file_total_sect, 0))
+        return false;
+
+    if (f_emu.parts)
+    {
+        fp = &f_emu.fp_gpp[sector / f_emu.part_size];
+        sector = sector % f_emu.part_size;
+
+        // Special handling for reads/writes which cross split file boundaries.
+        if (__builtin_expect(sector + num_sectors > f_emu.part_size, 0))
+        {
+            unsigned int remaining = num_sectors;
+            while (remaining > 0) {
+                const unsigned int cur_sectors = MIN(remaining, f_emu.part_size - sector);
+
+                if (f_lseek(fp, (uint64_t)sector << 9) != FR_OK)
+                    return false;
+
+                if (!is_write)
+                {
+                    if (f_read_fast(fp, buf, (uint64_t)cur_sectors << 9) != FR_OK)
+                        return false;
+                }
+                else
+                {
+                    if (f_write_fast(fp, buf, (uint64_t)cur_sectors << 9) != FR_OK)
+                        return false;
+                }
+
+                buf = (char *)buf + ((uint64_t)cur_sectors << 9);
+                remaining -= cur_sectors;
+                sector = 0;
+                ++fp;
+            }
+
+            return true;
+        }
+    }
+    else
+    {
+        fp = &f_emu.fp_gpp[0];
+    }
+
+    if (f_lseek(fp, (uint64_t)sector << 9) != FR_OK)
+        return false;
+
+    if (!is_write)
+        return (f_read_fast(fp, buf, (uint64_t)num_sectors << 9) == FR_OK);
+    else
+        return (f_write_fast(fp, buf, (uint64_t)num_sectors << 9) == FR_OK);
+}
+
+static unsigned int _cow_dma_chunk_sectors(sdmmc_accessor_t *acc, int dma_idx, unsigned int rem)
+{
+    uint64_t dma_cap = acc->parent->dmaBuffers[dma_idx].device_addr_buffer_size;
+    unsigned int cap_sects = (unsigned int)(dma_cap >> 9);
+    if (cap_sects == 0)
+        cap_sects = 1;
+    if (cap_sects > COW_BLOCK_SECTORS)
+        cap_sects = COW_BLOCK_SECTORS;
+    return (rem < cap_sects) ? rem : cap_sects;
+}
+
+static bool _file_based_gpp_raw_rw(void *buf, unsigned int sector, unsigned int num_sectors, bool is_write)
+{
+    /* When cow_engine reads/writes internal .bss buffers (superblock, L1, L2 cache way,
+     * or bounce_buf), stage through FS.kip's DMA buffer while saving and restoring its
+     * contents so an in-flight multi-sector FS.kip DMA buffer is never clobbered.
+     */
+    if (_current_accessor != NULL &&
+        num_sectors <= COW_BLOCK_SECTORS &&
+        !sdmmc_calculate_dma_addr(_current_accessor, buf, num_sectors))
+    {
+        int dma_idx = sdmmc_calculate_fitting_dma_index(_current_accessor, num_sectors);
+        void *dma_buf = &_current_accessor->parent->dmaBuffers[dma_idx].device_addr_buffer[0];
+        if (dma_buf == NULL)
+            return false;
+
+        uint8_t *p = (uint8_t *)buf;
+        unsigned int rem = num_sectors;
+        while (rem > 0)
+        {
+            unsigned int cur_sects = _cow_dma_chunk_sectors(_current_accessor, dma_idx, rem);
+            uint64_t bytes = (uint64_t)cur_sects << 9;
+
+            memcpy(g_dma_save_buf, dma_buf, bytes);
+            if (is_write)
+                memcpy(dma_buf, p, bytes);
+
+            bool ok = _file_based_gpp_raw_rw_inner(dma_buf, sector, cur_sects, is_write);
+
+            if (!is_write && ok)
+                memcpy(p, dma_buf, bytes);
+            memcpy(dma_buf, g_dma_save_buf, bytes);
+
+            if (!ok)
+                return false;
+
+            p      += bytes;
+            sector += cur_sects;
+            rem    -= cur_sects;
+        }
+        return true;
+    }
+
+    return _file_based_gpp_raw_rw_inner(buf, sector, num_sectors, is_write);
+}
+
+static bool _cow_read_base_gpp(void *ctx, uint32_t sector, uint32_t num_sectors, void *buf)
+{
+    (void)ctx;
+    sdmmc_accessor_t *accessor_nand = sdmmc_accessor_nand();
+    uint64_t bytes = (uint64_t)num_sectors << 9;
+
+    if (sdmmc_calculate_dma_addr(accessor_nand, buf, num_sectors))
+    {
+        return (accessor_nand->vtab->read_write(accessor_nand, sector, num_sectors, buf, bytes, 1) == 0);
+    }
+    else
+    {
+        /* Copy-up bounce buffer lies in .bss; stage through FS.kip's mapped NAND DMA buffer */
+        int dma_idx = sdmmc_calculate_fitting_dma_index(accessor_nand, num_sectors);
+        void *dma_buf = &accessor_nand->parent->dmaBuffers[dma_idx].device_addr_buffer[0];
+        if (dma_buf == NULL)
+            return false;
+
+        uint8_t *p = (uint8_t *)buf;
+        unsigned int rem = num_sectors;
+        while (rem > 0)
+        {
+            unsigned int cur_sects = _cow_dma_chunk_sectors(accessor_nand, dma_idx, rem);
+            uint64_t cur_bytes = (uint64_t)cur_sects << 9;
+
+            memcpy(g_dma_save_buf, dma_buf, cur_bytes);
+            uint64_t rc = accessor_nand->vtab->read_write(accessor_nand, sector, cur_sects, dma_buf, cur_bytes, 1);
+            if (rc == 0)
+                memcpy(p, dma_buf, cur_bytes);
+            memcpy(dma_buf, g_dma_save_buf, cur_bytes);
+
+            if (rc != 0)
+                return false;
+
+            p      += cur_bytes;
+            sector += cur_sects;
+            rem    -= cur_sects;
+        }
+        return true;
+    }
+}
+
+static bool _cow_read_prefix(void *ctx, uint32_t sector, uint32_t num_sectors, void *buf)
+{
+    (void)ctx;
+    return _file_based_gpp_raw_rw(buf, sector, num_sectors, false);
+}
+
+static bool _cow_write_prefix(void *ctx, uint32_t sector, uint32_t num_sectors, const void *buf)
+{
+    (void)ctx;
+    return _file_based_gpp_raw_rw((void *)buf, sector, num_sectors, true);
+}
+
+static bool _cow_read_cow(void *ctx, uint32_t cow_sector, uint32_t num_sectors, void *buf)
+{
+    (void)ctx;
+    return _file_based_gpp_raw_rw(buf, g_cow_base_sector + cow_sector, num_sectors, false);
+}
+
+static bool _cow_write_cow(void *ctx, uint32_t cow_sector, uint32_t num_sectors, const void *buf)
+{
+    (void)ctx;
+    return _file_based_gpp_raw_rw((void *)buf, g_cow_base_sector + cow_sector, num_sectors, true);
+}
+
+static bool _cow_sync_cow(void *ctx)
+{
+    (void)ctx;
+    return true;
+}
 
 static void _sdmmc_ensure_device_attached(void)
 {
@@ -214,7 +406,7 @@ static void _file_based_emmc_initialize(void)
             if (f_emu.parts == 1)
                 f_emu.parts = 0;
 
-            return;
+            break;
         }
 
         if (!f_expand_cltbl(&f_emu.fp_gpp[f_emu.parts], EMUMMC_FP_CLMT_COUNT,
@@ -224,6 +416,60 @@ static void _file_based_emmc_initialize(void)
         }
 
         f_emu.total_sect += (uint64_t)f_size(&f_emu.fp_gpp[f_emu.parts]) >> 9;
+    }
+
+    g_raw_file_total_sect = f_emu.total_sect;
+
+    if (g_cow_engine.initialized)
+    {
+        // Preserve active in-RAM COW state across any mid-boot SD re-initialization
+        f_emu.total_sect = g_cow_engine.hdr.gpp_total_sectors;
+        return;
+    }
+
+    // Detect cowMMC v2 superblock at offset 32 MB (Slot 0 = sector 65536, Slot 1 = sector 65568) of /eMMC/00
+    if (g_raw_file_total_sect > COW_DEFAULT_PREFIX_SECTS)
+    {
+        bool cow_magic_present = false;
+        cow_header_t probe_hdr;
+
+        if (_file_based_gpp_raw_rw(&probe_hdr, COW_DEFAULT_PREFIX_SECTS, 1U, false) &&
+            probe_hdr.magic == COW_MAGIC)
+        {
+            cow_magic_present = true;
+        }
+        else if (g_raw_file_total_sect > COW_DEFAULT_PREFIX_SECTS + COW_BLOCK_SECTORS &&
+                 _file_based_gpp_raw_rw(&probe_hdr, COW_DEFAULT_PREFIX_SECTS + COW_BLOCK_SECTORS, 1U, false) &&
+                 probe_hdr.magic == COW_MAGIC)
+        {
+            cow_magic_present = true;
+        }
+
+        if (cow_magic_present)
+        {
+            g_cow_base_sector = COW_DEFAULT_PREFIX_SECTS;
+            uint64_t raw_slots = (g_raw_file_total_sect - g_cow_base_sector) / COW_BLOCK_SECTORS;
+            uint32_t avail_slots = (raw_slots > UINT32_MAX) ? UINT32_MAX : (uint32_t)raw_slots;
+
+            if (avail_slots <= COW_SUPERBLOCK_SLOTS)
+                fatal_abort(Fatal_FatfsFileOpen);
+
+            cow_io_ops_t cow_io = {
+                .user_ctx      = NULL,
+                .read_base_gpp = _cow_read_base_gpp,
+                .read_prefix   = _cow_read_prefix,
+                .write_prefix  = _cow_write_prefix,
+                .read_cow      = _cow_read_cow,
+                .write_cow     = _cow_write_cow,
+                .sync_cow      = _cow_sync_cow,
+            };
+
+            if (!cow_engine_init_bounded(&g_cow_engine, &cow_io, avail_slots, true))
+                fatal_abort(Fatal_FatfsFileOpen);
+
+            // Expose physical GPP sector count to FS.kip & NAND Patrol
+            f_emu.total_sect = g_cow_engine.hdr.gpp_total_sectors;
+        }
     }
 }
 
@@ -340,47 +586,14 @@ static uint64_t emummc_read_write_inner(void *buf, unsigned int sector, unsigned
     switch (*active_partition)
     {
     case FS_EMMC_PARTITION_GPP:
-        if (f_emu.parts)
+        if (g_cow_engine.initialized)
         {
-            if (__builtin_expect(sector + num_sectors > f_emu.total_sect, 0))
-                return 0; // Out of bounds. Can only happen with Nand Patrol if resized.
-
-            fp = &f_emu.fp_gpp[sector / f_emu.part_size];
-            sector = sector % f_emu.part_size;
-
-            // Special handling for reads/writes which cross file-boundaries.
-            if (__builtin_expect(sector + num_sectors > f_emu.part_size, 0))
-            {
-                unsigned int remaining = num_sectors;
-                while (remaining > 0) {
-                    const unsigned int cur_sectors = MIN(remaining, f_emu.part_size - sector);
-
-                    if (f_lseek(fp, (uint64_t)sector << 9) != FR_OK)
-                        return 0; // Out of bounds.
-
-                    if (!is_write)
-                    {
-                        if (f_read_fast(fp, buf, (uint64_t)cur_sectors << 9) != FR_OK)
-                            return 0;
-                    }
-                    else
-                    {
-                        if (f_write_fast(fp, buf, (uint64_t)cur_sectors << 9) != FR_OK)
-                            return 0;
-                    }
-
-                    buf = (char *)buf + ((uint64_t)cur_sectors << 9);
-                    remaining -= cur_sectors;
-                    sector = 0;
-                    ++fp;
-                }
-
-                return 1;
-            }
+            if (!is_write)
+                return cow_engine_read_gpp(&g_cow_engine, sector, num_sectors, buf);
+            else
+                return cow_engine_write_gpp(&g_cow_engine, sector, num_sectors, buf);
         }
-        else
-            fp = &f_emu.fp_gpp[0];
-        break;
+        return _file_based_gpp_raw_rw(buf, sector, num_sectors, is_write);
 
     case FS_EMMC_PARTITION_BOOT1:
         fp = &f_emu.fp_boot1;
