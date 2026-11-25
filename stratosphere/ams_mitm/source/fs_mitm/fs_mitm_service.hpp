@@ -26,6 +26,7 @@
     AMS_SF_METHOD_INFO(C, H,  28, Result, DeleteSaveDataFileSystemBySaveDataAttribute, (u8 space_id, const ams::fs::SaveDataAttribute &attribute),                                                                                                         (space_id, attribute),                                               hos::Version_4_0_0)  \
     AMS_SF_METHOD_INFO(C, H,  51, Result, OpenSaveDataFileSystem,                      (sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u8 space_id, const ams::fs::SaveDataAttribute &attribute),                                                  (out, space_id, attribute))                                                               \
     AMS_SF_METHOD_INFO(C, H,  52, Result, OpenSaveDataFileSystemBySystemSaveDataId,    (sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u8 space_id, const ams::fs::SaveDataAttribute &attribute),                                                  (out, space_id, attribute))                                                               \
+    AMS_SF_METHOD_INFO(C, H,  53, Result, OpenReadOnlySaveDataFileSystem,              (sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u8 space_id, const ams::fs::SaveDataAttribute &attribute),                                                  (out, space_id, attribute),                                          hos::Version_2_0_0)  \
     AMS_SF_METHOD_INFO(C, H,  12, Result, OpenBisStorage,                              (sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out, u32 bis_partition_id),                                                                                         (out, bis_partition_id))                                                                  \
     AMS_SF_METHOD_INFO(C, H, 110, Result, OpenContentStorageFileSystem,                (sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u32 content_storage_id),                                                                                    (out, content_storage_id))                                                                \
     AMS_SF_METHOD_INFO(C, H, 200, Result, OpenDataStorageByCurrentProcess,             (sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out),                                                                                                               (out))                                                                                    \
@@ -95,6 +96,8 @@ namespace ams::mitm::fs {
 
                 return has_launched_qlaunch || ShouldMitmProgramId(client_info.program_id);
             }
+        private:
+            Result OpenSaveDataFileSystemImpl(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> &out, u8 space_id, const ams::fs::SaveDataAttribute &attribute, bool read_only);
         public:
             /* Overridden commands. */
             Result OpenFileSystemWithPatch(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, ncm::ProgramId program_id, u32 file_system_proxy_type);
@@ -105,6 +108,7 @@ namespace ams::mitm::fs {
             Result DeleteSaveDataFileSystemBySaveDataAttribute(u8 space_id, const ams::fs::SaveDataAttribute &attribute);
             Result OpenSaveDataFileSystem(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u8 space_id, const ams::fs::SaveDataAttribute &attribute);
             Result OpenSaveDataFileSystemBySystemSaveDataId(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u8 space_id, const ams::fs::SaveDataAttribute &attribute);
+            Result OpenReadOnlySaveDataFileSystem(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u8 space_id, const ams::fs::SaveDataAttribute &attribute);
             Result OpenBisStorage(sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out, u32 bis_partition_id);
             Result OpenContentStorageFileSystem(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u32 content_storage_id);
             Result OpenDataStorageByCurrentProcess(sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out);

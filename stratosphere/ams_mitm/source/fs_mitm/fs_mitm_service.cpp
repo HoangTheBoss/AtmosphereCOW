@@ -214,13 +214,22 @@ namespace ams::mitm::fs {
         R_SUCCEED();
     }
 
-    Result FsMitmService::OpenSaveDataFileSystem(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u8 space_id, const fs::SaveDataAttribute &attribute) {
-        /* We only want to intercept saves for games, right now. */
+    Result FsMitmService::OpenSaveDataFileSystemImpl(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> &out, u8 space_id, const fs::SaveDataAttribute &attribute, bool read_only) {
+        /* Never intercept Nintendo/Atmosphère system modules. */
+        R_UNLESS(!ncm::IsSystemProgramId(m_client_info.program_id), sm::mitm::ResultShouldForwardToSession());
+
+        /* Standard Atmosphère intercepts games and HBL. On cowMMC, also intercept homebrew forwarder NSPs (e.g. 0x05... Sphaira/JKSV forwarders) and user tools, excluding Nintendo system applets/reserved IDs. */
         const bool is_game_or_hbl = m_client_info.override_status.IsHbl() || ncm::IsApplicationId(m_client_info.program_id);
-        R_UNLESS(is_game_or_hbl, sm::mitm::ResultShouldForwardToSession());
+        const bool is_nintendo_system = ncm::IsSystemAppletId(m_client_info.program_id) ||
+                                        (m_client_info.program_id >= ncm::SystemProgramId::Start && m_client_info.program_id < ncm::ApplicationId::Start);
+        if (!is_game_or_hbl) {
+            R_UNLESS(!is_nintendo_system && IsCowMmcActive(), sm::mitm::ResultShouldForwardToSession());
+        }
 
         /* On cowMMC, force Account + Device save redirection to <cow_path>/saves/... unless explicitly disabled. */
         const bool force_cow_redirect = IsCowMmcActive() && !HasCowOrGlobalFlag("disable_save_redirect.flag");
+        R_UNLESS(is_game_or_hbl || force_cow_redirect, sm::mitm::ResultShouldForwardToSession());
+
         const bool is_supported_type  = (attribute.type == fs::SaveDataType::Account) ||
                                         (force_cow_redirect && attribute.type == fs::SaveDataType::Device);
         R_UNLESS(is_supported_type, sm::mitm::ResultShouldForwardToSession());
@@ -245,7 +254,10 @@ namespace ams::mitm::fs {
         static_assert(sizeof(fs::SaveDataAttribute) == sizeof(::FsSaveDataAttribute));
         FsFileSystem save_fs;
         std::unique_ptr<fs::fsa::IFileSystem> save_ifs = nullptr;
-        const bool has_bis_save = R_SUCCEEDED(fsOpenSaveDataFileSystemFwd(m_forward_service.get(), std::addressof(save_fs), _space_id, reinterpret_cast<const FsSaveDataAttribute *>(std::addressof(attribute))));
+        const Result fwd_res = read_only
+            ? fsOpenReadOnlySaveDataFileSystemFwd(m_forward_service.get(), std::addressof(save_fs), _space_id, reinterpret_cast<const FsSaveDataAttribute *>(std::addressof(attribute)))
+            : fsOpenSaveDataFileSystemFwd(m_forward_service.get(), std::addressof(save_fs), _space_id, reinterpret_cast<const FsSaveDataAttribute *>(std::addressof(attribute)));
+        const bool has_bis_save = R_SUCCEEDED(fwd_res);
         R_UNLESS(has_bis_save || force_cow_redirect, sm::mitm::ResultShouldForwardToSession());
         if (has_bis_save) {
             save_ifs = std::make_unique<fs::RemoteFileSystem>(save_fs);
@@ -286,24 +298,37 @@ namespace ams::mitm::fs {
         auto subdir_fs = std::make_unique<fssystem::SubDirectoryFileSystem>(sd_ifs);
         R_TRY(subdir_fs->Initialize(save_dir_path));
 
-        std::shared_ptr<fssystem::DirectorySaveDataFileSystem> dirsave_ifs = std::make_shared<fssystem::DirectorySaveDataFileSystem>(std::move(subdir_fs));
+        std::unique_ptr<fssystem::DirectorySaveDataFileSystem> dirsave_ifs = std::make_unique<fssystem::DirectorySaveDataFileSystem>(std::move(subdir_fs));
 
         /* Ensure correct directory savedata filesystem state. */
         R_TRY(dirsave_ifs->Initialize(true, true, true));
 
-        /* If it's the first time we're making the save, copy existing savedata over. */
+        /* If it's the first time we're making the save, copy existing savedata over and commit /1 -> /0. */
         if (is_new_save && save_ifs != nullptr) {
-            /* TODO: Check error? */
             fs::DirectoryEntry work_entry;
             constexpr const fs::Path root_path = fs::MakeConstantPath("/");
 
             u8 savedata_copy_buffer[2_KB];
-            R_DISCARD(fssystem::CopyDirectoryRecursively(dirsave_ifs.get(), save_ifs.get(), root_path, root_path, std::addressof(work_entry), savedata_copy_buffer, sizeof(savedata_copy_buffer)));
+            if (R_SUCCEEDED(fssystem::CopyDirectoryRecursively(dirsave_ifs.get(), save_ifs.get(), root_path, root_path, std::addressof(work_entry), savedata_copy_buffer, sizeof(savedata_copy_buffer)))) {
+                R_DISCARD(dirsave_ifs->Commit());
+            }
         }
 
         /* Set output. */
-        out.SetValue(MakeSharedFileSystem(std::move(dirsave_ifs), false), target_object_id);
+        if (read_only) {
+            out.SetValue(MakeSharedFileSystem(std::make_shared<fs::ReadOnlyFileSystem>(std::move(dirsave_ifs)), false), target_object_id);
+        } else {
+            out.SetValue(MakeSharedFileSystem(std::shared_ptr<fs::fsa::IFileSystem>(std::move(dirsave_ifs)), false), target_object_id);
+        }
         R_SUCCEED();
+    }
+
+    Result FsMitmService::OpenSaveDataFileSystem(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u8 space_id, const fs::SaveDataAttribute &attribute) {
+        R_RETURN(this->OpenSaveDataFileSystemImpl(out, space_id, attribute, false));
+    }
+
+    Result FsMitmService::OpenReadOnlySaveDataFileSystem(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u8 space_id, const fs::SaveDataAttribute &attribute) {
+        R_RETURN(this->OpenSaveDataFileSystemImpl(out, space_id, attribute, true));
     }
 
     Result FsMitmService::OpenBisStorage(sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out, u32 bis_partition_id) {
