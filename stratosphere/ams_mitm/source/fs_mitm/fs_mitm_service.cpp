@@ -33,6 +33,7 @@ namespace ams::mitm::fs {
         constexpr const ams::fs::Path AtmosphereHblWebContentDirPath = fs::MakeConstantPath("/atmosphere/hbl_html/");
         constexpr const ams::fs::Path OfwSdCardContentDirPath        = fs::MakeConstantPath("/Nintendo/Contents");
         constexpr const char ProgramWebContentDir[] = "/manual_html/";
+        constexpr u64 SdContentMetaSaveDataId = 0x8000000000000124ULL;
 
         constinit os::SdkMutex g_boot0_detect_lock;
         constinit bool g_detected_boot0_kind = false;
@@ -205,11 +206,11 @@ namespace ams::mitm::fs {
         R_TRY(fsOpenSdCardFileSystemFwd(m_forward_service.get(), std::addressof(sd_fs)));
         const sf::cmif::DomainObjectId target_object_id{serviceGetObjectId(std::addressof(sd_fs.s))};
 
-        /* Return output filesystem. */
-        auto redir_fs = std::make_shared<fssystem::DirectoryRedirectionFileSystem>(std::make_unique<RemoteFileSystem>(sd_fs));
+        /* Return output filesystem wrapped in cowMMC post-reset delete guard. */
+        auto redir_fs = std::make_unique<fssystem::DirectoryRedirectionFileSystem>(std::make_unique<RemoteFileSystem>(sd_fs));
         R_TRY(redir_fs->InitializeWithFixedPath("/Nintendo", emummc::GetNintendoDirPath()));
 
-        out.SetValue(MakeSharedFileSystem(std::move(redir_fs), false), target_object_id);
+        out.SetValue(MakeSharedFileSystem(std::make_shared<CowNsSdCardGuardFileSystem>(std::move(redir_fs)), false), target_object_id);
         R_SUCCEED();
     }
 
@@ -444,6 +445,24 @@ namespace ams::mitm::fs {
         return IsCowMmcActive();
     }
 
+    bool ShouldBlockSdContentDeletes() {
+        if (!emummc::IsActive()) {
+            return false;
+        }
+
+        /* Fail closed during early boot before ams_mitm's global SD filesystem is open
+         * so ns/ncm cannot race past post_reset_migrate.flag before HasSdFile() works. */
+        if (!mitm::IsInitialized()) {
+            return true;
+        }
+
+        if (!IsCowMmcActive()) {
+            return false;
+        }
+
+        return HasCowOrGlobalFlag("post_reset_migrate.flag");
+    }
+
     namespace {
 
         void MaybeAcknowledgeCowBoot(ncm::ProgramId client_program_id) {
@@ -491,6 +510,43 @@ namespace ams::mitm::fs {
 
     }
 
+    Result FsMitmService::DeleteSaveDataFileSystemBySaveDataSpaceId(u8 indexer_space_id, u64 save_data_id) {
+        if (emummc::IsActive() &&
+            static_cast<fs::SaveDataSpaceId>(indexer_space_id) == fs::SaveDataSpaceId::SdSystem &&
+            save_data_id == SdContentMetaSaveDataId &&
+            ShouldBlockSdContentDeletes()) {
+            R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+        }
+
+        R_THROW(sm::mitm::ResultShouldForwardToSession());
+    }
+
+    Result FsMitmService::DeleteSaveDataFileSystemBySaveDataAttribute(u8 space_id, const fs::SaveDataAttribute &attribute) {
+        if (emummc::IsActive() &&
+            static_cast<fs::SaveDataSpaceId>(space_id) == fs::SaveDataSpaceId::SdSystem &&
+            attribute.system_save_data_id == SdContentMetaSaveDataId &&
+            ShouldBlockSdContentDeletes()) {
+            R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+        }
+
+        R_THROW(sm::mitm::ResultShouldForwardToSession());
+    }
+
+    Result FsMitmService::OpenSaveDataFileSystemBySystemSaveDataId(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u8 space_id, const fs::SaveDataAttribute &attribute) {
+        R_UNLESS(emummc::IsActive(), sm::mitm::ResultShouldForwardToSession());
+        R_UNLESS(static_cast<fs::SaveDataSpaceId>(space_id) == fs::SaveDataSpaceId::SdSystem, sm::mitm::ResultShouldForwardToSession());
+        R_UNLESS(attribute.system_save_data_id == SdContentMetaSaveDataId, sm::mitm::ResultShouldForwardToSession());
+
+        static_assert(sizeof(fs::SaveDataAttribute) == sizeof(::FsSaveDataAttribute));
+        FsFileSystem meta_fs;
+        R_TRY(fsOpenSaveDataFileSystemBySystemSaveDataIdFwd(m_forward_service.get(), std::addressof(meta_fs), static_cast<FsSaveDataSpaceId>(space_id), reinterpret_cast<const FsSaveDataAttribute *>(std::addressof(attribute))));
+        const sf::cmif::DomainObjectId target_object_id{serviceGetObjectId(std::addressof(meta_fs.s))};
+        std::unique_ptr<fs::fsa::IFileSystem> meta_ifs = std::make_unique<fs::RemoteFileSystem>(meta_fs);
+
+        out.SetValue(MakeSharedFileSystem(std::make_shared<CowSdMetaSaveFileSystem>(std::move(meta_ifs)), false), target_object_id);
+        R_SUCCEED();
+    }
+
     Result FsMitmService::OpenContentStorageFileSystem(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u32 content_storage_id) {
         R_UNLESS(emummc::IsActive(), sm::mitm::ResultShouldForwardToSession());
 
@@ -506,9 +562,8 @@ namespace ams::mitm::fs {
             R_SUCCEED();
         }
 
-        /* We only want to layer ContentStorageId::SdCard when emuMMC/COW is active and OFW Nintendo sharing is enabled. */
-        R_UNLESS(cs_id == fs::ContentStorageId::SdCard,                                                  sm::mitm::ResultShouldForwardToSession());
-        R_UNLESS(cfg::HasGlobalFlag("share_ofw_nintendo"),                                              sm::mitm::ResultShouldForwardToSession());
+        /* Wrap ContentStorageId::SdCard unconditionally when emuMMC is active so post_reset_migrate.flag blocks ns boot-time NCA wipes. */
+        R_UNLESS(cs_id == fs::ContentStorageId::SdCard, sm::mitm::ResultShouldForwardToSession());
 
         /* Open the primary (emuMMC/COW) SD ContentStorage filesystem via fsp-srv. */
         FsFileSystem primary_cs_fs;
@@ -520,21 +575,23 @@ namespace ams::mitm::fs {
         R_DISCARD(fssystem::EnsureDirectory(primary_ifs.get(), fs::MakeConstantPath("/registered")));
         R_DISCARD(fssystem::EnsureDirectory(primary_ifs.get(), fs::MakeConstantPath("/placehld")));
 
-        /* Open the unredirected SD card root using fs.mitm's session to construct the read-only OFW /Nintendo/Contents fallback. */
-        FsFileSystem sd_fs;
-        if (R_SUCCEEDED(fsOpenSdCardFileSystem(std::addressof(sd_fs)))) {
-            std::unique_ptr<fs::fsa::IFileSystem> sd_ifs = std::make_unique<fs::RemoteFileSystem>(sd_fs);
-            auto ofw_subdir_fs = std::make_unique<fssystem::SubDirectoryFileSystem>(std::move(sd_ifs));
-            if (R_SUCCEEDED(ofw_subdir_fs->Initialize(OfwSdCardContentDirPath))) {
-                /* Return a COW layered ContentStorage filesystem (read-write primary over read-only OFW fallback). */
-                auto layered_cs_fs = std::make_shared<CowLayeredContentStorageFileSystem>(std::move(primary_ifs), std::move(ofw_subdir_fs));
-                out.SetValue(MakeSharedFileSystem(std::move(layered_cs_fs), false), target_object_id);
-                R_SUCCEED();
+        if (cfg::HasGlobalFlag("share_ofw_nintendo")) {
+            /* Open the unredirected SD card root using fs.mitm's session to construct the read-only OFW /Nintendo/Contents fallback. */
+            FsFileSystem sd_fs;
+            if (R_SUCCEEDED(fsOpenSdCardFileSystem(std::addressof(sd_fs)))) {
+                std::unique_ptr<fs::fsa::IFileSystem> sd_ifs = std::make_unique<fs::RemoteFileSystem>(sd_fs);
+                auto ofw_subdir_fs = std::make_unique<fssystem::SubDirectoryFileSystem>(std::move(sd_ifs));
+                if (R_SUCCEEDED(ofw_subdir_fs->Initialize(OfwSdCardContentDirPath))) {
+                    /* Return a COW layered ContentStorage filesystem (read-write primary over read-only OFW fallback). */
+                    auto layered_cs_fs = std::make_shared<CowLayeredContentStorageFileSystem>(std::move(primary_ifs), std::move(ofw_subdir_fs));
+                    out.SetValue(MakeSharedFileSystem(std::move(layered_cs_fs), false), target_object_id);
+                    R_SUCCEED();
+                }
             }
         }
 
-        /* If the OFW fallback could not be opened, gracefully return the primary ContentStorage filesystem. */
-        out.SetValue(MakeSharedFileSystem(std::shared_ptr<fs::fsa::IFileSystem>(std::move(primary_ifs)), false), target_object_id);
+        /* Default (or OFW fallback miss): guard primary SD ContentStorage against post-reset deletes. */
+        out.SetValue(MakeSharedFileSystem(std::make_shared<CowSdContentStorageFileSystem>(std::move(primary_ifs)), false), target_object_id);
         R_SUCCEED();
     }
 

@@ -19,6 +19,7 @@ Result fsOpenFileSystemWithIdFwd(Service* s, FsFileSystem* out, const char* cont
 Result fsOpenBisStorageFwd(Service* s, FsStorage* out, FsBisPartitionId partition_id);
 Result fsOpenSdCardFileSystemFwd(Service* s, FsFileSystem* out);
 Result fsOpenSaveDataFileSystemFwd(Service* s, FsFileSystem* out, FsSaveDataSpaceId save_data_space_id, const FsSaveDataAttribute *attr);
+Result fsOpenSaveDataFileSystemBySystemSaveDataIdFwd(Service* s, FsFileSystem* out, FsSaveDataSpaceId save_data_space_id, const FsSaveDataAttribute *attr);
 Result fsOpenContentStorageFileSystemFwd(Service* s, FsFileSystem* out, FsContentStorageId content_storage_id);
 
 Result fsOpenDataStorageByCurrentProcessFwd(Service* s, FsStorage* out);

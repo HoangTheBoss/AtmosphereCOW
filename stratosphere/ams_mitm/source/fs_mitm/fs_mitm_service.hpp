@@ -22,7 +22,10 @@
     AMS_SF_METHOD_INFO(C, H,   8, Result, OpenFileSystemWithIdObsolete,                (sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, const fssrv::sf::Path &path, ncm::ProgramId program_id, u32 file_system_proxy_type),                        (out, path, program_id, file_system_proxy_type),                     hos::Version_2_0_0)  \
     AMS_SF_METHOD_INFO(C, H,  10, Result, OpenFileSystemWithId,                        (sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, const fssrv::sf::Path &path, u8 content_attributes, ncm::ProgramId program_id, u32 file_system_proxy_type), (out, path, content_attributes, program_id, file_system_proxy_type), hos::Version_16_0_0) \
     AMS_SF_METHOD_INFO(C, H,  18, Result, OpenSdCardFileSystem,                        (sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out),                                                                                                            (out))                                                                                    \
+    AMS_SF_METHOD_INFO(C, H,  25, Result, DeleteSaveDataFileSystemBySaveDataSpaceId,   (u8 indexer_space_id, u64 save_data_id),                                                                                                                            (indexer_space_id, save_data_id),                                    hos::Version_2_0_0)  \
+    AMS_SF_METHOD_INFO(C, H,  28, Result, DeleteSaveDataFileSystemBySaveDataAttribute, (u8 space_id, const ams::fs::SaveDataAttribute &attribute),                                                                                                         (space_id, attribute),                                               hos::Version_4_0_0)  \
     AMS_SF_METHOD_INFO(C, H,  51, Result, OpenSaveDataFileSystem,                      (sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u8 space_id, const ams::fs::SaveDataAttribute &attribute),                                                  (out, space_id, attribute))                                                               \
+    AMS_SF_METHOD_INFO(C, H,  52, Result, OpenSaveDataFileSystemBySystemSaveDataId,    (sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u8 space_id, const ams::fs::SaveDataAttribute &attribute),                                                  (out, space_id, attribute))                                                               \
     AMS_SF_METHOD_INFO(C, H,  12, Result, OpenBisStorage,                              (sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out, u32 bis_partition_id),                                                                                         (out, bis_partition_id))                                                                  \
     AMS_SF_METHOD_INFO(C, H, 110, Result, OpenContentStorageFileSystem,                (sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u32 content_storage_id),                                                                                    (out, content_storage_id))                                                                \
     AMS_SF_METHOD_INFO(C, H, 200, Result, OpenDataStorageByCurrentProcess,             (sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out),                                                                                                               (out))                                                                                    \
@@ -43,6 +46,7 @@ namespace ams::mitm::fs {
 
     bool IsCowMmcActive();
     bool HasCowOrGlobalFlag(const char *flag_file_name);
+    bool ShouldBlockSdContentDeletes();
 
     class FsMitmService  : public sf::MitmServiceImplBase {
         public:
@@ -97,7 +101,10 @@ namespace ams::mitm::fs {
             Result OpenFileSystemWithIdObsolete(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, const fssrv::sf::Path &path, ncm::ProgramId program_id, u32 file_system_proxy_type);
             Result OpenFileSystemWithId(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, const fssrv::sf::Path &path, u8 content_attributes, ncm::ProgramId program_id, u32 file_system_proxy_type);
             Result OpenSdCardFileSystem(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out);
+            Result DeleteSaveDataFileSystemBySaveDataSpaceId(u8 indexer_space_id, u64 save_data_id);
+            Result DeleteSaveDataFileSystemBySaveDataAttribute(u8 space_id, const ams::fs::SaveDataAttribute &attribute);
             Result OpenSaveDataFileSystem(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u8 space_id, const ams::fs::SaveDataAttribute &attribute);
+            Result OpenSaveDataFileSystemBySystemSaveDataId(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u8 space_id, const ams::fs::SaveDataAttribute &attribute);
             Result OpenBisStorage(sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out, u32 bis_partition_id);
             Result OpenContentStorageFileSystem(sf::Out<sf::SharedPointer<ams::fssrv::sf::IFileSystem>> out, u32 content_storage_id);
             Result OpenDataStorageByCurrentProcess(sf::Out<sf::SharedPointer<ams::fssrv::sf::IStorage>> out);

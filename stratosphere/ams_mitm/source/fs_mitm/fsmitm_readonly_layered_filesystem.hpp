@@ -103,6 +103,70 @@ namespace ams::mitm::fs {
             }
     };
 
+    bool ShouldBlockSdContentDeletes();
+
+    namespace {
+
+        inline bool PathEqualsOrChild(const char *path, const char *prefix) {
+            const size_t len = std::strlen(prefix);
+            return std::strncmp(path, prefix, len) == 0 && (path[len] == '\0' || path[len] == '/');
+        }
+
+        inline bool IsSdPlaceHolderChildPath(const ams::fs::Path &path) {
+            const char *s = path.GetString();
+            const size_t len = std::strlen("/placehld/");
+            return std::strncmp(s, "/placehld/", len) == 0 && s[len] != '\0';
+        }
+
+        inline bool IsSdPlaceHolderPathOrChild(const ams::fs::Path &path) {
+            return PathEqualsOrChild(path.GetString(), "/placehld");
+        }
+
+        inline bool IsSdRegisteredPath(const ams::fs::Path &path) {
+            return PathEqualsOrChild(path.GetString(), "/registered");
+        }
+
+        inline bool IsProtectedNsSdPath(const ams::fs::Path &path) {
+            const char *s = path.GetString();
+            return std::strcmp(s, "/") == 0 ||
+                   std::strcmp(s, "/Nintendo") == 0 ||
+                   std::strcmp(s, "/Nintendo/Contents") == 0 ||
+                   PathEqualsOrChild(s, "/Nintendo/Contents/registered") ||
+                   std::strcmp(s, "/Nintendo/save") == 0 ||
+                   PathEqualsOrChild(s, "/Nintendo/save/8000000000000124");
+        }
+
+        inline Result GuardSdContentDeletePath(const ams::fs::Path &path) {
+            if (ShouldBlockSdContentDeletes() && !IsSdPlaceHolderChildPath(path)) {
+                R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+            }
+            R_SUCCEED();
+        }
+
+        inline Result GuardSdContentCleanPath(const ams::fs::Path &path) {
+            if (ShouldBlockSdContentDeletes() && !IsSdPlaceHolderPathOrChild(path)) {
+                R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+            }
+            R_SUCCEED();
+        }
+
+        inline Result GuardSdContentRenamePath(const ams::fs::Path &old_path) {
+            if (ShouldBlockSdContentDeletes() && IsSdRegisteredPath(old_path)) {
+                R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+            }
+            R_SUCCEED();
+        }
+
+        inline Result GuardSdContentOpenMode(const ams::fs::Path &path, ams::fs::OpenMode mode) {
+            if (ShouldBlockSdContentDeletes() && IsSdRegisteredPath(path) &&
+                (mode & ams::fs::OpenMode_All) != ams::fs::OpenMode_Read) {
+                R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+            }
+            R_SUCCEED();
+        }
+
+    }
+
     /*
      * Copy-on-Write / Read-Only Fallback ContentStorage FileSystem for cowMMC:
      *   - Primary filesystem (m_primary_fs): Read-Write emuMMC SD ContentStorage (/emuMMC/COW0/Nintendo/Contents).
@@ -125,6 +189,7 @@ namespace ams::mitm::fs {
             }
 
             virtual Result DoDeleteFile(const ams::fs::Path &path) override final {
+                R_TRY(GuardSdContentDeletePath(path));
                 R_RETURN(m_primary_fs->DeleteFile(path));
             }
 
@@ -133,18 +198,22 @@ namespace ams::mitm::fs {
             }
 
             virtual Result DoDeleteDirectory(const ams::fs::Path &path) override final {
+                R_TRY(GuardSdContentDeletePath(path));
                 R_RETURN(m_primary_fs->DeleteDirectory(path));
             }
 
             virtual Result DoDeleteDirectoryRecursively(const ams::fs::Path &path) override final {
+                R_TRY(GuardSdContentDeletePath(path));
                 R_RETURN(m_primary_fs->DeleteDirectoryRecursively(path));
             }
 
             virtual Result DoRenameFile(const ams::fs::Path &old_path, const ams::fs::Path &new_path) override final {
+                R_TRY(GuardSdContentRenamePath(old_path));
                 R_RETURN(m_primary_fs->RenameFile(old_path, new_path));
             }
 
             virtual Result DoRenameDirectory(const ams::fs::Path &old_path, const ams::fs::Path &new_path) override final {
+                R_TRY(GuardSdContentRenamePath(old_path));
                 R_RETURN(m_primary_fs->RenameDirectory(old_path, new_path));
             }
 
@@ -154,6 +223,7 @@ namespace ams::mitm::fs {
             }
 
             virtual Result DoOpenFile(std::unique_ptr<ams::fs::fsa::IFile> *out_file, const ams::fs::Path &path, ams::fs::OpenMode mode) override final {
+                R_TRY(GuardSdContentOpenMode(path, mode));
                 R_SUCCEED_IF(R_SUCCEEDED(m_primary_fs->OpenFile(out_file, path, mode)));
                 if ((mode & ams::fs::OpenMode_All) == ams::fs::OpenMode_Read) {
                     R_RETURN(m_fallback_fs.OpenFile(out_file, path, mode));
@@ -179,6 +249,7 @@ namespace ams::mitm::fs {
             }
 
             virtual Result DoCleanDirectoryRecursively(const ams::fs::Path &path) override final {
+                R_TRY(GuardSdContentCleanPath(path));
                 R_RETURN(m_primary_fs->CleanDirectoryRecursively(path));
             }
 
@@ -294,6 +365,311 @@ namespace ams::mitm::fs {
             }
 
             virtual Result DoCleanDirectoryRecursively(const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->CleanDirectoryRecursively(path));
+            }
+
+            virtual Result DoGetFileTimeStampRaw(ams::fs::FileTimeStampRaw *out, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->GetFileTimeStampRaw(out, path));
+            }
+
+            virtual Result DoQueryEntry(char *dst, size_t dst_size, const char *src, size_t src_size, ams::fs::fsa::QueryId query, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->QueryEntry(dst, dst_size, src, src_size, query, path));
+            }
+    };
+
+    /*
+     * ContentStorageId::SdCard Delete-Guard FileSystem for cowMMC (non-layered default):
+     *   - Wraps the emuMMC SD ContentStorage filesystem unconditionally when cowMMC/emuMMC is active.
+     *   - While ShouldBlockSdContentDeletes() is true (post_reset_migrate.flag present or early boot
+     *     before global SD init), rejects deletes outside /placehld/ and rejects renames/write-opens
+     *     targeting /registered with ResultUnsupportedWriteForReadOnlyFileSystem(), preventing HOS ns
+     *     boot-time orphan cleanup from wiping installed SD NCAs before cow_manager Migrate SD runs.
+     */
+    class CowSdContentStorageFileSystem : public ams::fs::fsa::IFileSystem {
+        private:
+            std::unique_ptr<ams::fs::fsa::IFileSystem> m_base_fs;
+        public:
+            explicit CowSdContentStorageFileSystem(std::unique_ptr<ams::fs::fsa::IFileSystem> base_fs)
+                : m_base_fs(std::move(base_fs)) { /* ... */ }
+
+            virtual ~CowSdContentStorageFileSystem() { /* ... */ }
+        private:
+            virtual Result DoCreateFile(const ams::fs::Path &path, s64 size, int flags) override final {
+                R_RETURN(m_base_fs->CreateFile(path, size, flags));
+            }
+
+            virtual Result DoDeleteFile(const ams::fs::Path &path) override final {
+                R_TRY(GuardSdContentDeletePath(path));
+                R_RETURN(m_base_fs->DeleteFile(path));
+            }
+
+            virtual Result DoCreateDirectory(const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->CreateDirectory(path));
+            }
+
+            virtual Result DoDeleteDirectory(const ams::fs::Path &path) override final {
+                R_TRY(GuardSdContentDeletePath(path));
+                R_RETURN(m_base_fs->DeleteDirectory(path));
+            }
+
+            virtual Result DoDeleteDirectoryRecursively(const ams::fs::Path &path) override final {
+                R_TRY(GuardSdContentDeletePath(path));
+                R_RETURN(m_base_fs->DeleteDirectoryRecursively(path));
+            }
+
+            virtual Result DoRenameFile(const ams::fs::Path &old_path, const ams::fs::Path &new_path) override final {
+                R_TRY(GuardSdContentRenamePath(old_path));
+                R_RETURN(m_base_fs->RenameFile(old_path, new_path));
+            }
+
+            virtual Result DoRenameDirectory(const ams::fs::Path &old_path, const ams::fs::Path &new_path) override final {
+                R_TRY(GuardSdContentRenamePath(old_path));
+                R_RETURN(m_base_fs->RenameDirectory(old_path, new_path));
+            }
+
+            virtual Result DoGetEntryType(ams::fs::DirectoryEntryType *out, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->GetEntryType(out, path));
+            }
+
+            virtual Result DoOpenFile(std::unique_ptr<ams::fs::fsa::IFile> *out_file, const ams::fs::Path &path, ams::fs::OpenMode mode) override final {
+                R_TRY(GuardSdContentOpenMode(path, mode));
+                R_RETURN(m_base_fs->OpenFile(out_file, path, mode));
+            }
+
+            virtual Result DoOpenDirectory(std::unique_ptr<ams::fs::fsa::IDirectory> *out_dir, const ams::fs::Path &path, ams::fs::OpenDirectoryMode mode) override final {
+                R_RETURN(m_base_fs->OpenDirectory(out_dir, path, mode));
+            }
+
+            virtual Result DoCommit() override final {
+                R_RETURN(m_base_fs->Commit());
+            }
+
+            virtual Result DoGetFreeSpaceSize(s64 *out, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->GetFreeSpaceSize(out, path));
+            }
+
+            virtual Result DoGetTotalSpaceSize(s64 *out, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->GetTotalSpaceSize(out, path));
+            }
+
+            virtual Result DoCleanDirectoryRecursively(const ams::fs::Path &path) override final {
+                R_TRY(GuardSdContentCleanPath(path));
+                R_RETURN(m_base_fs->CleanDirectoryRecursively(path));
+            }
+
+            virtual Result DoGetFileTimeStampRaw(ams::fs::FileTimeStampRaw *out, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->GetFileTimeStampRaw(out, path));
+            }
+
+            virtual Result DoQueryEntry(char *dst, size_t dst_size, const char *src, size_t src_size, ams::fs::fsa::QueryId query, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->QueryEntry(dst, dst_size, src, src_size, query, path));
+            }
+    };
+
+    /*
+     * SD ContentMetaDatabase Save Guard (SdSystem 0x8000000000000124) for cowMMC:
+     *   - Preserves reads, directory listings, and CreateDirectory so ncm Verify/Activate/List work
+     *     and cow_manager Migrate SD can enumerate SD content meta keys.
+     *   - While ShouldBlockSdContentDeletes() is true, rejects file creates/deletes/renames and
+     *     write-mode opens on /imkvdb.arc so ncm/ns cannot purge or overwrite the SD content meta DB.
+     */
+    class CowSdMetaSaveFileSystem : public ams::fs::fsa::IFileSystem {
+        private:
+            std::unique_ptr<ams::fs::fsa::IFileSystem> m_base_fs;
+        public:
+            explicit CowSdMetaSaveFileSystem(std::unique_ptr<ams::fs::fsa::IFileSystem> base_fs)
+                : m_base_fs(std::move(base_fs)) { /* ... */ }
+
+            virtual ~CowSdMetaSaveFileSystem() { /* ... */ }
+        private:
+            virtual Result DoCreateFile(const ams::fs::Path &path, s64 size, int flags) override final {
+                if (ShouldBlockSdContentDeletes()) {
+                    AMS_UNUSED(path, size, flags);
+                    R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+                }
+                R_RETURN(m_base_fs->CreateFile(path, size, flags));
+            }
+
+            virtual Result DoDeleteFile(const ams::fs::Path &path) override final {
+                if (ShouldBlockSdContentDeletes()) {
+                    AMS_UNUSED(path);
+                    R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+                }
+                R_RETURN(m_base_fs->DeleteFile(path));
+            }
+
+            virtual Result DoCreateDirectory(const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->CreateDirectory(path));
+            }
+
+            virtual Result DoDeleteDirectory(const ams::fs::Path &path) override final {
+                if (ShouldBlockSdContentDeletes()) {
+                    AMS_UNUSED(path);
+                    R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+                }
+                R_RETURN(m_base_fs->DeleteDirectory(path));
+            }
+
+            virtual Result DoDeleteDirectoryRecursively(const ams::fs::Path &path) override final {
+                if (ShouldBlockSdContentDeletes()) {
+                    AMS_UNUSED(path);
+                    R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+                }
+                R_RETURN(m_base_fs->DeleteDirectoryRecursively(path));
+            }
+
+            virtual Result DoRenameFile(const ams::fs::Path &old_path, const ams::fs::Path &new_path) override final {
+                if (ShouldBlockSdContentDeletes()) {
+                    AMS_UNUSED(old_path, new_path);
+                    R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+                }
+                R_RETURN(m_base_fs->RenameFile(old_path, new_path));
+            }
+
+            virtual Result DoRenameDirectory(const ams::fs::Path &old_path, const ams::fs::Path &new_path) override final {
+                if (ShouldBlockSdContentDeletes()) {
+                    AMS_UNUSED(old_path, new_path);
+                    R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+                }
+                R_RETURN(m_base_fs->RenameDirectory(old_path, new_path));
+            }
+
+            virtual Result DoGetEntryType(ams::fs::DirectoryEntryType *out, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->GetEntryType(out, path));
+            }
+
+            virtual Result DoOpenFile(std::unique_ptr<ams::fs::fsa::IFile> *out_file, const ams::fs::Path &path, ams::fs::OpenMode mode) override final {
+                if (ShouldBlockSdContentDeletes() && (mode & ams::fs::OpenMode_All) != ams::fs::OpenMode_Read) {
+                    AMS_UNUSED(out_file, path);
+                    R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+                }
+                R_RETURN(m_base_fs->OpenFile(out_file, path, mode));
+            }
+
+            virtual Result DoOpenDirectory(std::unique_ptr<ams::fs::fsa::IDirectory> *out_dir, const ams::fs::Path &path, ams::fs::OpenDirectoryMode mode) override final {
+                R_RETURN(m_base_fs->OpenDirectory(out_dir, path, mode));
+            }
+
+            virtual Result DoCommit() override final {
+                R_RETURN(m_base_fs->Commit());
+            }
+
+            virtual Result DoGetFreeSpaceSize(s64 *out, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->GetFreeSpaceSize(out, path));
+            }
+
+            virtual Result DoGetTotalSpaceSize(s64 *out, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->GetTotalSpaceSize(out, path));
+            }
+
+            virtual Result DoCleanDirectoryRecursively(const ams::fs::Path &path) override final {
+                if (ShouldBlockSdContentDeletes()) {
+                    AMS_UNUSED(path);
+                    R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+                }
+                R_RETURN(m_base_fs->CleanDirectoryRecursively(path));
+            }
+
+            virtual Result DoGetFileTimeStampRaw(ams::fs::FileTimeStampRaw *out, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->GetFileTimeStampRaw(out, path));
+            }
+
+            virtual Result DoQueryEntry(char *dst, size_t dst_size, const char *src, size_t src_size, ams::fs::fsa::QueryId query, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->QueryEntry(dst, dst_size, src, src_size, query, path));
+            }
+    };
+
+    /*
+     * NS SD Card Redirection Delete-Guard for cowMMC:
+     *   - Wraps the DirectoryRedirectionFileSystem returned by OpenSdCardFileSystem for ns.
+     *   - While ShouldBlockSdContentDeletes() is true, blocks deletes, recursive cleans, renames,
+     *     and write-mode opens targeting /Nintendo/Contents/registered, /Nintendo/save/8000000000000124,
+     *     or their parent containers.
+     */
+    class CowNsSdCardGuardFileSystem : public ams::fs::fsa::IFileSystem {
+        private:
+            std::unique_ptr<ams::fs::fsa::IFileSystem> m_base_fs;
+        public:
+            explicit CowNsSdCardGuardFileSystem(std::unique_ptr<ams::fs::fsa::IFileSystem> base_fs)
+                : m_base_fs(std::move(base_fs)) { /* ... */ }
+
+            virtual ~CowNsSdCardGuardFileSystem() { /* ... */ }
+        private:
+            virtual Result DoCreateFile(const ams::fs::Path &path, s64 size, int flags) override final {
+                R_RETURN(m_base_fs->CreateFile(path, size, flags));
+            }
+
+            virtual Result DoDeleteFile(const ams::fs::Path &path) override final {
+                if (ShouldBlockSdContentDeletes() && IsProtectedNsSdPath(path)) {
+                    R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+                }
+                R_RETURN(m_base_fs->DeleteFile(path));
+            }
+
+            virtual Result DoCreateDirectory(const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->CreateDirectory(path));
+            }
+
+            virtual Result DoDeleteDirectory(const ams::fs::Path &path) override final {
+                if (ShouldBlockSdContentDeletes() && IsProtectedNsSdPath(path)) {
+                    R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+                }
+                R_RETURN(m_base_fs->DeleteDirectory(path));
+            }
+
+            virtual Result DoDeleteDirectoryRecursively(const ams::fs::Path &path) override final {
+                if (ShouldBlockSdContentDeletes() && IsProtectedNsSdPath(path)) {
+                    R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+                }
+                R_RETURN(m_base_fs->DeleteDirectoryRecursively(path));
+            }
+
+            virtual Result DoRenameFile(const ams::fs::Path &old_path, const ams::fs::Path &new_path) override final {
+                if (ShouldBlockSdContentDeletes() && IsProtectedNsSdPath(old_path)) {
+                    R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+                }
+                R_RETURN(m_base_fs->RenameFile(old_path, new_path));
+            }
+
+            virtual Result DoRenameDirectory(const ams::fs::Path &old_path, const ams::fs::Path &new_path) override final {
+                if (ShouldBlockSdContentDeletes() && IsProtectedNsSdPath(old_path)) {
+                    R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+                }
+                R_RETURN(m_base_fs->RenameDirectory(old_path, new_path));
+            }
+
+            virtual Result DoGetEntryType(ams::fs::DirectoryEntryType *out, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->GetEntryType(out, path));
+            }
+
+            virtual Result DoOpenFile(std::unique_ptr<ams::fs::fsa::IFile> *out_file, const ams::fs::Path &path, ams::fs::OpenMode mode) override final {
+                if (ShouldBlockSdContentDeletes() && IsProtectedNsSdPath(path) &&
+                    (mode & ams::fs::OpenMode_All) != ams::fs::OpenMode_Read) {
+                    R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+                }
+                R_RETURN(m_base_fs->OpenFile(out_file, path, mode));
+            }
+
+            virtual Result DoOpenDirectory(std::unique_ptr<ams::fs::fsa::IDirectory> *out_dir, const ams::fs::Path &path, ams::fs::OpenDirectoryMode mode) override final {
+                R_RETURN(m_base_fs->OpenDirectory(out_dir, path, mode));
+            }
+
+            virtual Result DoCommit() override final {
+                R_RETURN(m_base_fs->Commit());
+            }
+
+            virtual Result DoGetFreeSpaceSize(s64 *out, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->GetFreeSpaceSize(out, path));
+            }
+
+            virtual Result DoGetTotalSpaceSize(s64 *out, const ams::fs::Path &path) override final {
+                R_RETURN(m_base_fs->GetTotalSpaceSize(out, path));
+            }
+
+            virtual Result DoCleanDirectoryRecursively(const ams::fs::Path &path) override final {
+                if (ShouldBlockSdContentDeletes() && IsProtectedNsSdPath(path)) {
+                    R_THROW(ams::fs::ResultUnsupportedWriteForReadOnlyFileSystem());
+                }
                 R_RETURN(m_base_fs->CleanDirectoryRecursively(path));
             }
 

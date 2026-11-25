@@ -90,6 +90,19 @@ Result fsOpenSaveDataFileSystemFwd(Service* s, FsFileSystem* out, FsSaveDataSpac
     );
 }
 
+Result fsOpenSaveDataFileSystemBySystemSaveDataIdFwd(Service* s, FsFileSystem* out, FsSaveDataSpaceId save_data_space_id, const FsSaveDataAttribute *attr) {
+    const struct {
+        u8 save_data_space_id;
+        u8 pad[7];
+        FsSaveDataAttribute attr;
+    } in = { (u8)save_data_space_id, {0}, *attr };
+
+    return serviceDispatchIn(s, 52, in,
+        .out_num_objects = 1,
+        .out_objects = &out->s,
+    );
+}
+
 Result fsOpenContentStorageFileSystemFwd(Service* s, FsFileSystem* out, FsContentStorageId content_storage_id) {
     const u32 tmp = content_storage_id;
     return serviceDispatchIn(s, 110, tmp,
